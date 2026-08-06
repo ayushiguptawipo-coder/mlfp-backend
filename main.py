@@ -161,9 +161,8 @@ def analyze_stock(ticker: str):
     clean_df = res_df.dropna(subset=['Ret_Unfilt', 'Ret_Filt', 'Forward_Return'])
     
     target_df = generate_hybrid_features(fetch_upstox_data(ticker))
-    target_df['Volatility_Regime'] = KMeans(n_clusters=2, random_state=42, n_init=10).fit(scaled_vol).predict(
-        StandardScaler().fit(log_vol).transform(np.log(target_df[['Rolling_Vol']] + 1e-8)
-    )
+    vol_scaled_target = StandardScaler().fit(log_vol).transform(np.log(target_df[['Rolling_Vol']] + 1e-8))
+    target_df['Volatility_Regime'] = KMeans(n_clusters=2, random_state=42, n_init=10).fit(scaled_vol).predict(vol_scaled_target)
     current_regime = 'Low Volatility' if target_df['Volatility_Regime'].iloc[-1] == regime_means.idxmin() else 'High Volatility'
     
     final_scaler = StandardScaler()
