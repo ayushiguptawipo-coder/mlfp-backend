@@ -5,6 +5,7 @@ import numpy as np
 import re
 import json
 import urllib.parse
+import feedparser
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from xgboost import XGBClassifier
@@ -170,13 +171,12 @@ def analyze_stock(ticker: str):
     live_model = models[best_model_name].fit(X_scaled, y)
     prob_up = live_model.predict_proba(final_scaler.transform(target_df[feature_cols].iloc[[-1]]))[0][1]
 
-    # --- GEMINI API WITH BOT-BYPASS ---
+    # --- GEMINI API ENGINE ---
     ai_score, ai_summary = 0.0, "AI Sentiment Unavailable"
     try:
         q = urllib.parse.quote(f"{ticker} stock news India")
         rss_url = f"https://news.google.com/rss/search?q={q}&hl=en-IN&gl=IN&ceid=IN:en"
         
-        # Mask the request to bypass bot-detection blocks
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
         rss_resp = requests.get(rss_url, headers=headers)
         feed = feedparser.parse(rss_resp.content)
