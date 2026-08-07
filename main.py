@@ -171,6 +171,14 @@ def analyze_stock(ticker: str):
     live_model = models[best_model_name].fit(X_scaled, y)
     prob_up = live_model.predict_proba(final_scaler.transform(target_df[feature_cols].iloc[[-1]]))[0][1]
 
+    # --- CONVICTION THRESHOLD LOGIC (No-Trade Zone: 45% to 55%) ---
+    if prob_up >= 0.55:
+        quant_signal = "BULLISH"
+    elif prob_up <= 0.45:
+        quant_signal = "BEARISH"
+    else:
+        quant_signal = "NEUTRAL"
+
     # --- GEMINI API ENGINE ---
     ai_score, ai_summary = 0.0, "AI Sentiment Unavailable"
     try:
@@ -206,7 +214,7 @@ def analyze_stock(ticker: str):
         "ticker": ticker,
         "current_regime": current_regime,
         "best_model": best_model_name,
-        "quant_signal": "BULLISH" if prob_up >= 0.5 else "BEARISH",
+        "quant_signal": quant_signal,
         "quant_probability": round(prob_up * 100, 2),
         "ai_sentiment_score": ai_score,
         "ai_summary": ai_summary,
