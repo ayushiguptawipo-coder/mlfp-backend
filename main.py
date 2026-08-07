@@ -190,7 +190,7 @@ def analyze_stock(ticker: str):
         prompt = f"Analyze these recent news headlines for '{ticker}':\n{headlines}\nReturn ONLY a valid JSON: {{\"sentiment_score\": <float -1.0 to 1.0>, \"executive_summary\": \"<1 sentence>\"}}"
         
         resp = client.models.generate_content(
-            model='gemini-2.5-flash', 
+            model='gemini-3.5-flash', 
             contents=prompt, 
             config=types.GenerateContentConfig(response_mime_type="application/json")
         )
