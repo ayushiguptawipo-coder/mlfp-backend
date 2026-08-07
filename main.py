@@ -170,18 +170,37 @@ def analyze_stock(ticker: str):
     live_model = models[best_model_name].fit(X_scaled, y)
     prob_up = live_model.predict_proba(final_scaler.transform(target_df[feature_cols].iloc[[-1]]))[0][1]
 
+    # --- GEMINI API WITH BOT-BYPASS ---
     ai_score, ai_summary = 0.0, "AI Sentiment Unavailable"
     try:
         q = urllib.parse.quote(f"{ticker} stock news India")
-        feed = feedparser.parse(f"https://news.google.com/rss/search?q={q}&hl=en-IN&gl=IN&ceid=IN:en")
+        rss_url = f"https://news.google.com/rss/search?q={q}&hl=en-IN&gl=IN&ceid=IN:en"
+        
+        # Mask the request to bypass bot-detection blocks
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
+        rss_resp = requests.get(rss_url, headers=headers)
+        feed = feedparser.parse(rss_resp.content)
+        
         headlines = "\n".join([f"- {h.title}" for h in feed.entries[:10]])
+        
+        if not headlines.strip():
+            raise ValueError("No headlines found.")
+
         client = genai.Client(api_key=GEMINI_API_KEY, http_options=types.HttpOptions(retry_options=types.HttpRetryOptions(initial_delay=1.0, attempts=2)))
         prompt = f"Analyze these recent news headlines for '{ticker}':\n{headlines}\nReturn ONLY a valid JSON: {{\"sentiment_score\": <float -1.0 to 1.0>, \"executive_summary\": \"<1 sentence>\"}}"
-        resp = client.models.generate_content(model='gemini-3.5-flash', contents=prompt, config=types.GenerateContentConfig(response_mime_type="application/json"))
+        
+        resp = client.models.generate_content(
+            model='gemini-2.5-flash', 
+            contents=prompt, 
+            config=types.GenerateContentConfig(response_mime_type="application/json")
+        )
+        
         match = re.search(r'\{.*\}', resp.text, re.DOTALL)
         ai_json = json.loads(match.group(0)) if match else json.loads(resp.text)
-        ai_score, ai_summary = ai_json.get('sentiment_score', 0), ai_json.get('executive_summary', "")
-    except Exception: pass
+        ai_score = ai_json.get('sentiment_score', 0)
+        ai_summary = ai_json.get('executive_summary', "No summary provided.")
+    except Exception as e:
+        ai_summary = f"API Diagnostic: {str(e)}"
 
     return {
         "ticker": ticker,
