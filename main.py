@@ -233,6 +233,7 @@ def analyze_stock(ticker: str, friction: float = Query(0.0015), neutral_band: fl
     elif prob_up <= lower_bound: quant_signal = "BEARISH"
     else: quant_signal = "NEUTRAL"
 
+    # --- GEMINI API ENGINE ---
     ai_score, ai_summary = 0.0, "AI Sentiment Feed Unavailable"
     try:
         q = urllib.parse.quote(f"{ticker} stock news India")
@@ -245,16 +246,31 @@ def analyze_stock(ticker: str, friction: float = Query(0.0015), neutral_band: fl
         headlines = "\n".join([f"- {h.title}" for h in feed.entries[:10]])
         if headlines.strip():
             client = genai.Client(api_key=GEMINI_API_KEY)
-            prompt = f"Analyze these recent news headlines for '{ticker}':\n{headlines}\nReturn ONLY a valid JSON: {{\"sentiment_score\": <float -1.0 to 1.0>, \"executive_summary\": \"<1 sentence>\"}}"
+            
+            # UPGRADE 1: Stricter prompt to prevent internal quotation mark breaks
+            prompt = f"Analyze these recent news headlines for '{ticker}':\n{headlines}\nReturn ONLY a valid JSON: {{\"sentiment_score\": <float -1.0 to 1.0>, \"executive_summary\": \"<1 sentence summary. DO NOT use any double quotes inside this sentence.>\"}}"
             
             resp = client.models.generate_content(
                 model='gemini-3.5-flash', 
                 contents=prompt, 
                 config=types.GenerateContentConfig(response_mime_type="application/json")
             )
-            match = re.search(r'\{.*\}', resp.text, re.DOTALL)
-            ai_json = json.loads(match.group(0)) if match else json.loads(resp.text)
-            ai_score = ai_json.get('sentiment_score', 0)
+            
+            raw_text = resp.text.strip()
+            match = re.search(r'\{.*\}', raw_text, re.DOTALL)
+            clean_json_string = match.group(0) if match else raw_text
+            
+            # UPGRADE 2: Armor-plated JSON parsing with a safe fallback
+            try:
+                ai_json = json.loads(clean_json_string)
+            except Exception:
+                # If Gemini hallucinates a bad character, safely catch the text instead of crashing
+                ai_json = {
+                    "sentiment_score": 0.0, 
+                    "executive_summary": clean_json_string.replace('"', "'").replace('\n', ' ') + " (Formatting Recovered)"
+                }
+                
+            ai_score = ai_json.get('sentiment_score', 0.0)
             ai_summary = ai_json.get('executive_summary', "No summary provided.")
     except Exception as e:
         ai_summary = f"API Diagnostic: News parser failed. ({str(e)})"
