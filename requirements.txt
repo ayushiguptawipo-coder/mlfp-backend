@@ -1,10 +1,9 @@
 fastapi
 uvicorn
+requests
 pandas
 numpy
-xgboost
 scikit-learn
+xgboost
 feedparser
 google-genai
-requests
-pydantic
