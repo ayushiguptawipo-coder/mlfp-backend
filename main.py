@@ -36,8 +36,6 @@ app.add_middleware(
 )
 
 # --- GLOBAL CRASH HANDLER ---
-# Forces FastAPI to send exact Python errors to the frontend WITH CORS headers,
-# preventing the browser from throwing a generic "Failed to fetch" security block.
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     return JSONResponse(
@@ -63,7 +61,6 @@ def fetch_upstox_data(symbol, years=2):
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {UPSTOX_ACCESS_TOKEN}'}
     
     try:
-        # Increased timeout and catching all connection errors
         response = requests.get(url, headers=headers, timeout=5)
         if response.status_code == 200:
             data = response.json().get('data', {}).get('candles', [])
@@ -142,11 +139,11 @@ def get_market_scanner():
         else: status = "yellow"
             
         results.append({
-            "ticker": ticker,
-            "regime": regime,
-            "signal": signal,
-            "price": round(curr_close, 2),
-            "status": status
+            "ticker": str(ticker),
+            "regime": str(regime),
+            "signal": str(signal),
+            "price": float(round(curr_close, 2)),
+            "status": str(status)
         })
     return {"scanner": results}
 
@@ -157,8 +154,6 @@ def analyze_stock(ticker: str, friction: float = Query(0.0015), neutral_band: fl
         raise HTTPException(status_code=400, detail="Ticker not supported.")
     
     raw_data = fetch_upstox_data(ticker)
-    
-    # Safe error catching: Changed from 500 to 400 to force CORS delivery
     if raw_data.empty: 
         raise HTTPException(status_code=400, detail=f"Upstox API failed to return data for {ticker}. The data source might be timing out.")
         
@@ -264,29 +259,30 @@ def analyze_stock(ticker: str, friction: float = Query(0.0015), neutral_band: fl
     except Exception as e:
         ai_summary = f"API Diagnostic: News parser failed. ({str(e)})"
 
+    # THE FIX: Explicitly forcing every output to standard Python float/int/str types
     return {
-        "ticker": ticker,
-        "current_regime": master_df['Regime_Label'].iloc[-1],
-        "best_model": best_model_name,
-        "quant_signal": quant_signal,
-        "quant_probability": round(prob_up * 100, 2),
-        "ai_sentiment_score": ai_score,
-        "ai_summary": ai_summary,
+        "ticker": str(ticker),
+        "current_regime": str(master_df['Regime_Label'].iloc[-1]),
+        "best_model": str(best_model_name),
+        "quant_signal": str(quant_signal),
+        "quant_probability": float(round(float(prob_up) * 100, 2)),
+        "ai_sentiment_score": float(ai_score),
+        "ai_summary": str(ai_summary),
         "diagnostics": {
             "unfiltered_trades": int(clean_df['OOS_Pred'].diff().abs().sum()),
             "filtered_trades": int(clean_df['Pos_Filt'].diff().abs().sum()),
-            "unfiltered_friction_pct": round(clean_df['Friction_Unfilt'].sum() * 100, 2),
-            "filtered_friction_pct": round(clean_df['Friction_Filt'].sum() * 100, 2)
+            "unfiltered_friction_pct": float(round(float(clean_df['Friction_Unfilt'].sum()) * 100, 2)),
+            "filtered_friction_pct": float(round(float(clean_df['Friction_Filt'].sum()) * 100, 2))
         },
         "performance": {
-            "buy_and_hold_pct": round((np.exp(clean_df['Forward_Return'].sum()) - 1) * 100, 2),
-            "unfiltered_strat_pct": round((np.exp(clean_df['Ret_Unfilt'].sum()) - 1) * 100, 2),
-            "filtered_strat_pct": round((np.exp(clean_df['Ret_Filt'].sum()) - 1) * 100, 2)
+            "buy_and_hold_pct": float(round((np.exp(float(clean_df['Forward_Return'].sum())) - 1) * 100, 2)),
+            "unfiltered_strat_pct": float(round((np.exp(float(clean_df['Ret_Unfilt'].sum())) - 1) * 100, 2)),
+            "filtered_strat_pct": float(round((np.exp(float(clean_df['Ret_Filt'].sum())) - 1) * 100, 2))
         },
         "chart_data": {
             "labels": [str(d.date()) for d in clean_df['Date']],
-            "buy_hold": [round(x, 4) for x in list(np.exp(clean_df['Forward_Return'].cumsum()) - 1)],
-            "unfiltered": [round(x, 4) for x in list(np.exp(clean_df['Ret_Unfilt'].cumsum()) - 1)],
-            "filtered": [round(x, 4) for x in list(np.exp(clean_df['Ret_Filt'].cumsum()) - 1)]
+            "buy_hold": [float(round(x, 4)) for x in (np.exp(clean_df['Forward_Return'].cumsum()) - 1).tolist()],
+            "unfiltered": [float(round(x, 4)) for x in (np.exp(clean_df['Ret_Unfilt'].cumsum()) - 1).tolist()],
+            "filtered": [float(round(x, 4)) for x in (np.exp(clean_df['Ret_Filt'].cumsum()) - 1).tolist()]
         }
     }
