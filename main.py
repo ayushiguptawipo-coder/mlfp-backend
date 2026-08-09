@@ -6,7 +6,8 @@ import re
 import json
 import urllib.parse
 import feedparser
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from xgboost import XGBClassifier
 from sklearn.ensemble import RandomForestClassifier
@@ -34,6 +35,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --- GLOBAL CRASH HANDLER ---
+# Forces FastAPI to send exact Python errors to the frontend WITH CORS headers,
+# preventing the browser from throwing a generic "Failed to fetch" security block.
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    return JSONResponse(
+        status_code=400,
+        content={"detail": f"Backend Diagnostic: {str(exc)}"},
+        headers={"Access-Control-Allow-Origin": "*"}
+    )
+
 UPSTOX_KEYS = {
     'SBIN': 'NSE_EQ|INE062A01020',
     'RELIANCE': 'NSE_EQ|INE002A01018',
@@ -51,14 +63,15 @@ def fetch_upstox_data(symbol, years=2):
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {UPSTOX_ACCESS_TOKEN}'}
     
     try:
-        response = requests.get(url, headers=headers, timeout=4)
+        # Increased timeout and catching all connection errors
+        response = requests.get(url, headers=headers, timeout=5)
         if response.status_code == 200:
             data = response.json().get('data', {}).get('candles', [])
             if not data: return pd.DataFrame()
             df = pd.DataFrame(data, columns=['Date', 'Open', 'High', 'Low', 'ClosePrice', 'Volume', 'OI'])
             df['Date'] = pd.to_datetime(df['Date']).dt.tz_localize(None)
             return df.sort_values('Date').reset_index(drop=True)[['Date', 'ClosePrice', 'Volume']]
-    except requests.exceptions.Timeout:
+    except Exception:
         pass
     return pd.DataFrame()
 
@@ -76,7 +89,7 @@ def generate_hybrid_features(df):
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     df['RSI_14'] = 100 - (100 / (1 + (gain / loss)))
     
-    # NEW: Institutional MACD Momentum Indicators
+    # Institutional MACD Momentum Indicators
     ema_12 = df['ClosePrice'].ewm(span=12, adjust=False).mean()
     ema_26 = df['ClosePrice'].ewm(span=26, adjust=False).mean()
     df['MACD'] = ema_12 - ema_26
@@ -144,8 +157,11 @@ def analyze_stock(ticker: str, friction: float = Query(0.0015), neutral_band: fl
         raise HTTPException(status_code=400, detail="Ticker not supported.")
     
     raw_data = fetch_upstox_data(ticker)
+    
+    # Safe error catching: Changed from 500 to 400 to force CORS delivery
     if raw_data.empty: 
-        raise HTTPException(status_code=500, detail="Failed to fetch target Upstox data.")
+        raise HTTPException(status_code=400, detail=f"Upstox API failed to return data for {ticker}. The data source might be timing out.")
+        
     master_df = generate_hybrid_features(raw_data)
 
     log_vol = np.log(master_df[['Rolling_Vol']] + 1e-8)
@@ -159,7 +175,6 @@ def analyze_stock(ticker: str, friction: float = Query(0.0015), neutral_band: fl
     feature_cols = ['Log_Returns', 'SMA_20_Dist', 'RSI_14', 'Relative_Volume', 'Log_Returns_Lag1', 'Log_Returns_Lag2', 'AR1_Forecast', 'MACD', 'MACD_Hist']
     X, y = master_df[feature_cols], master_df['Target_Direction']
     
-    # UPGRADE: XGBoost added to the model suite
     models = {
         "XGBoost": XGBClassifier(n_estimators=100, max_depth=4, learning_rate=0.05, random_state=42, eval_metric='logloss'),
         "Random Forest": RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42),
@@ -247,7 +262,7 @@ def analyze_stock(ticker: str, friction: float = Query(0.0015), neutral_band: fl
             ai_score = ai_json.get('sentiment_score', 0)
             ai_summary = ai_json.get('executive_summary', "No summary provided.")
     except Exception as e:
-        ai_summary = f"API Diagnostic: Request timed out or failed to parse. ({str(e)})"
+        ai_summary = f"API Diagnostic: News parser failed. ({str(e)})"
 
     return {
         "ticker": ticker,
