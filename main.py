@@ -86,7 +86,6 @@ def generate_hybrid_features(df):
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     df['RSI_14'] = 100 - (100 / (1 + (gain / loss)))
     
-    # Institutional MACD Momentum Indicators
     ema_12 = df['ClosePrice'].ewm(span=12, adjust=False).mean()
     ema_26 = df['ClosePrice'].ewm(span=26, adjust=False).mean()
     df['MACD'] = ema_12 - ema_26
@@ -113,7 +112,8 @@ def generate_hybrid_features(df):
     df['Rolling_Vol'] = df['Log_Returns'].rolling(window=10).std()
     return df.dropna().reset_index(drop=True)
 
-@app.get("/")
+# --- FIX: Accept both GET and HEAD requests so Render's health check passes ---
+@app.api_route("/", methods=["GET", "HEAD"])
 def home():
     return {"status": "MLFP Quant Engine API is online."}
 
@@ -233,7 +233,7 @@ def analyze_stock(ticker: str, friction: float = Query(0.0015), neutral_band: fl
     elif prob_up <= lower_bound: quant_signal = "BEARISH"
     else: quant_signal = "NEUTRAL"
 
-    # --- GEMINI API ENGINE ---
+    # --- GEMINI API ENGINE WITH QUOTE SAFETY ---
     ai_score, ai_summary = 0.0, "AI Sentiment Feed Unavailable"
     try:
         q = urllib.parse.quote(f"{ticker} stock news India")
@@ -247,7 +247,6 @@ def analyze_stock(ticker: str, friction: float = Query(0.0015), neutral_band: fl
         if headlines.strip():
             client = genai.Client(api_key=GEMINI_API_KEY)
             
-            # UPGRADE 1: Stricter prompt to prevent internal quotation mark breaks
             prompt = f"Analyze these recent news headlines for '{ticker}':\n{headlines}\nReturn ONLY a valid JSON: {{\"sentiment_score\": <float -1.0 to 1.0>, \"executive_summary\": \"<1 sentence summary. DO NOT use any double quotes inside this sentence.>\"}}"
             
             resp = client.models.generate_content(
@@ -260,14 +259,12 @@ def analyze_stock(ticker: str, friction: float = Query(0.0015), neutral_band: fl
             match = re.search(r'\{.*\}', raw_text, re.DOTALL)
             clean_json_string = match.group(0) if match else raw_text
             
-            # UPGRADE 2: Armor-plated JSON parsing with a safe fallback
             try:
                 ai_json = json.loads(clean_json_string)
             except Exception:
-                # If Gemini hallucinates a bad character, safely catch the text instead of crashing
                 ai_json = {
                     "sentiment_score": 0.0, 
-                    "executive_summary": clean_json_string.replace('"', "'").replace('\n', ' ') + " (Formatting Recovered)"
+                    "executive_summary": clean_json_string.replace('"', "'").replace('\n', ' ')
                 }
                 
             ai_score = ai_json.get('sentiment_score', 0.0)
@@ -275,7 +272,6 @@ def analyze_stock(ticker: str, friction: float = Query(0.0015), neutral_band: fl
     except Exception as e:
         ai_summary = f"API Diagnostic: News parser failed. ({str(e)})"
 
-    # THE FIX: Explicitly forcing every output to standard Python float/int/str types
     return {
         "ticker": str(ticker),
         "current_regime": str(master_df['Regime_Label'].iloc[-1]),
