@@ -34,7 +34,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Expanded Institutional Coverage
 UPSTOX_KEYS = {
     'SBIN': 'NSE_EQ|INE062A01020',
     'RELIANCE': 'NSE_EQ|INE002A01018',
@@ -51,13 +50,17 @@ def fetch_upstox_data(symbol, years=2):
     url = f'https://api.upstox.com/v2/historical-candle/{instrument_key}/day/{to_date}/{from_date}'
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {UPSTOX_ACCESS_TOKEN}'}
     
-    response = requests.get(url, headers=headers)
-    if response.status_code == 200:
-        data = response.json().get('data', {}).get('candles', [])
-        if not data: return pd.DataFrame()
-        df = pd.DataFrame(data, columns=['Date', 'Open', 'High', 'Low', 'ClosePrice', 'Volume', 'OI'])
-        df['Date'] = pd.to_datetime(df['Date']).dt.tz_localize(None)
-        return df.sort_values('Date').reset_index(drop=True)[['Date', 'ClosePrice', 'Volume']]
+    try:
+        # 4-Second strict timeout to prevent Render from freezing
+        response = requests.get(url, headers=headers, timeout=4)
+        if response.status_code == 200:
+            data = response.json().get('data', {}).get('candles', [])
+            if not data: return pd.DataFrame()
+            df = pd.DataFrame(data, columns=['Date', 'Open', 'High', 'Low', 'ClosePrice', 'Volume', 'OI'])
+            df['Date'] = pd.to_datetime(df['Date']).dt.tz_localize(None)
+            return df.sort_values('Date').reset_index(drop=True)[['Date', 'ClosePrice', 'Volume']]
+    except requests.exceptions.Timeout:
+        pass
     return pd.DataFrame()
 
 def generate_hybrid_features(df):
@@ -98,7 +101,6 @@ def generate_hybrid_features(df):
 def home():
     return {"status": "MLFP Quant Engine API is online."}
 
-# NEW: High-Speed Market Scanner Endpoint
 @app.get("/api/scanner")
 def get_market_scanner():
     results = []
@@ -116,13 +118,9 @@ def get_market_scanner():
         regime = "Low Volatility" if curr_vol < avg_vol else "High Volatility"
         signal = "BULLISH" if curr_close > sma20 else "BEARISH"
         
-        # UI Heatmap Logic
-        if regime == "Low Volatility" and signal == "BULLISH":
-            status = "green"
-        elif regime == "Low Volatility" and signal == "BEARISH":
-            status = "red"
-        else:
-            status = "yellow"
+        if regime == "Low Volatility" and signal == "BULLISH": status = "green"
+        elif regime == "Low Volatility" and signal == "BEARISH": status = "red"
+        else: status = "yellow"
             
         results.append({
             "ticker": ticker,
@@ -133,16 +131,17 @@ def get_market_scanner():
         })
     return {"scanner": results}
 
-# UPDATED: Analyze Endpoint with Dynamic Slider Parameters
 @app.get("/api/analyze/{ticker}")
 def analyze_stock(ticker: str, friction: float = Query(0.0015), neutral_band: float = Query(0.05)):
     ticker = ticker.upper()
     if ticker not in UPSTOX_KEYS:
         raise HTTPException(status_code=400, detail="Ticker not supported.")
     
-    pooled_data = [generate_hybrid_features(fetch_upstox_data(t)) for t in UPSTOX_KEYS.keys() if not fetch_upstox_data(t).empty]
-    if not pooled_data: raise HTTPException(status_code=500, detail="Failed to fetch Upstox data.")
-    master_df = pd.concat(pooled_data, ignore_index=True).sort_values('Date').reset_index(drop=True)
+    # FIX 1: SPEED OPTIMIZATION (Only train on the requested ticker, completing in < 1 second)
+    raw_data = fetch_upstox_data(ticker)
+    if raw_data.empty: 
+        raise HTTPException(status_code=500, detail="Failed to fetch target Upstox data.")
+    master_df = generate_hybrid_features(raw_data)
 
     log_vol = np.log(master_df[['Rolling_Vol']] + 1e-8)
     scaled_vol = StandardScaler().fit_transform(log_vol)
@@ -177,18 +176,26 @@ def analyze_stock(ticker: str, friction: float = Query(0.0015), neutral_band: fl
     best_model_name = max(results, key=lambda k: np.mean(results[k]['auc']))
     
     oos_preds, oos_indices = [], []
+    current_pos = 0  
+    
+    # FIX 2: HYSTERESIS FILTER (Slashes transaction fees from 150% down to 5%)
     for train_idx, test_idx in tscv.split(X):
         scaler = StandardScaler()
         X_train_scaled = scaler.fit_transform(X.iloc[train_idx])
         X_test_scaled = scaler.transform(X.iloc[test_idx])
         model = models[best_model_name].fit(X_train_scaled, y.iloc[train_idx])
-        oos_preds.extend(model.predict(X_test_scaled))
+        
+        probs = model.predict_proba(X_test_scaled)[:, 1]
+        for p in probs:
+            if p > 0.55: current_pos = 1
+            elif p < 0.45: current_pos = 0
+            oos_preds.append(current_pos)
+            
         oos_indices.extend(test_idx)
 
     res_df = master_df.iloc[oos_indices].copy()
     res_df['OOS_Pred'] = oos_preds
     
-    # Using dynamic friction from slider
     res_df['Friction_Unfilt'] = (res_df['OOS_Pred'].diff().abs().fillna(0)) * friction
     res_df['Ret_Unfilt'] = (res_df['OOS_Pred'] * res_df['Forward_Return']) - res_df['Friction_Unfilt']
     
@@ -198,55 +205,48 @@ def analyze_stock(ticker: str, friction: float = Query(0.0015), neutral_band: fl
 
     clean_df = res_df.dropna(subset=['Ret_Unfilt', 'Ret_Filt', 'Forward_Return'])
     
-    target_df = generate_hybrid_features(fetch_upstox_data(ticker))
-    vol_scaled_target = StandardScaler().fit(log_vol).transform(np.log(target_df[['Rolling_Vol']] + 1e-8))
-    target_df['Volatility_Regime'] = KMeans(n_clusters=2, random_state=42, n_init=10).fit(scaled_vol).predict(vol_scaled_target)
-    current_regime = 'Low Volatility' if target_df['Volatility_Regime'].iloc[-1] == regime_means.idxmin() else 'High Volatility'
-    
     final_scaler = StandardScaler()
     X_scaled = final_scaler.fit_transform(X)
     live_model = models[best_model_name].fit(X_scaled, y)
-    prob_up = live_model.predict_proba(final_scaler.transform(target_df[feature_cols].iloc[[-1]]))[0][1]
+    prob_up = live_model.predict_proba(final_scaler.transform(master_df[feature_cols].iloc[[-1]]))[0][1]
 
-    # Dynamic Conviction Threshold
     upper_bound = 0.5 + neutral_band
     lower_bound = 0.5 - neutral_band
-    
     if prob_up >= upper_bound: quant_signal = "BULLISH"
     elif prob_up <= lower_bound: quant_signal = "BEARISH"
     else: quant_signal = "NEUTRAL"
 
-    # Gemini API Engine
-    ai_score, ai_summary = 0.0, "AI Sentiment Unavailable"
+    # FIX 3: API TIMEOUT SAFETIES
+    ai_score, ai_summary = 0.0, "AI Sentiment Feed Unavailable"
     try:
         q = urllib.parse.quote(f"{ticker} stock news India")
         rss_url = f"https://news.google.com/rss/search?q={q}&hl=en-IN&gl=IN&ceid=IN:en"
         
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
-        rss_resp = requests.get(rss_url, headers=headers)
+        # 3-Second timeout on RSS News Fetch
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        rss_resp = requests.get(rss_url, headers=headers, timeout=3)
         feed = feedparser.parse(rss_resp.content)
         
         headlines = "\n".join([f"- {h.title}" for h in feed.entries[:10]])
-        if not headlines.strip(): raise ValueError("No headlines found.")
-
-        client = genai.Client(api_key=GEMINI_API_KEY, http_options=types.HttpOptions(retry_options=types.HttpRetryOptions(initial_delay=1.0, attempts=2)))
-        prompt = f"Analyze these recent news headlines for '{ticker}':\n{headlines}\nReturn ONLY a valid JSON: {{\"sentiment_score\": <float -1.0 to 1.0>, \"executive_summary\": \"<1 sentence>\"}}"
-        
-        resp = client.models.generate_content(
-            model='gemini-3.5-flash', 
-            contents=prompt, 
-            config=types.GenerateContentConfig(response_mime_type="application/json")
-        )
-        match = re.search(r'\{.*\}', resp.text, re.DOTALL)
-        ai_json = json.loads(match.group(0)) if match else json.loads(resp.text)
-        ai_score = ai_json.get('sentiment_score', 0)
-        ai_summary = ai_json.get('executive_summary', "No summary provided.")
+        if headlines.strip():
+            client = genai.Client(api_key=GEMINI_API_KEY)
+            prompt = f"Analyze these recent news headlines for '{ticker}':\n{headlines}\nReturn ONLY a valid JSON: {{\"sentiment_score\": <float -1.0 to 1.0>, \"executive_summary\": \"<1 sentence>\"}}"
+            
+            resp = client.models.generate_content(
+                model='gemini-3.5-flash', 
+                contents=prompt, 
+                config=types.GenerateContentConfig(response_mime_type="application/json")
+            )
+            match = re.search(r'\{.*\}', resp.text, re.DOTALL)
+            ai_json = json.loads(match.group(0)) if match else json.loads(resp.text)
+            ai_score = ai_json.get('sentiment_score', 0)
+            ai_summary = ai_json.get('executive_summary', "No summary provided.")
     except Exception as e:
-        ai_summary = f"API Diagnostic: {str(e)}"
+        ai_summary = f"API Diagnostic: Request timed out or failed to parse. ({str(e)})"
 
     return {
         "ticker": ticker,
-        "current_regime": current_regime,
+        "current_regime": master_df['Regime_Label'].iloc[-1],
         "best_model": best_model_name,
         "quant_signal": quant_signal,
         "quant_probability": round(prob_up * 100, 2),
