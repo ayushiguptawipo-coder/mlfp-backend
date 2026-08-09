@@ -6,7 +6,7 @@ import re
 import json
 import urllib.parse
 import feedparser
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from xgboost import XGBClassifier
 from sklearn.ensemble import RandomForestClassifier
@@ -20,13 +20,12 @@ from google import genai
 from google.genai import types
 from datetime import datetime, timedelta
 
-# SECURE ENVIRONMENT VARIABLES (Pulled directly from Render)
+# SECURE ENVIRONMENT VARIABLES 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 UPSTOX_ACCESS_TOKEN = os.environ.get("UPSTOX_ACCESS_TOKEN")
 
 app = FastAPI(title="MLFP Quant Engine API")
 
-# Allow Web Dashboard Frontend Communication
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -35,11 +34,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-FRICTION_COST = 0.0015
+# Expanded Institutional Coverage
 UPSTOX_KEYS = {
     'SBIN': 'NSE_EQ|INE062A01020',
     'RELIANCE': 'NSE_EQ|INE002A01018',
-    'INFY': 'NSE_EQ|INE009A01021'
+    'INFY': 'NSE_EQ|INE009A01021',
+    'TCS': 'NSE_EQ|INE467B01029',
+    'HDFCBANK': 'NSE_EQ|INE040A01034',
+    'ICICIBANK': 'NSE_EQ|INE090A01021'
 }
 
 def fetch_upstox_data(symbol, years=2):
@@ -94,17 +96,50 @@ def generate_hybrid_features(df):
 
 @app.get("/")
 def home():
-    return {"status": "MLFP Quant Engine API is online and running!"}
+    return {"status": "MLFP Quant Engine API is online."}
 
+# NEW: High-Speed Market Scanner Endpoint
+@app.get("/api/scanner")
+def get_market_scanner():
+    results = []
+    for ticker in UPSTOX_KEYS.keys():
+        df = fetch_upstox_data(ticker, years=1)
+        if df.empty or len(df) < 30: continue
+        
+        df['Rolling_Vol'] = np.log(df['ClosePrice'] / df['ClosePrice'].shift(1)).replace([np.inf, -np.inf], np.nan).fillna(0).rolling(10).std()
+        sma20 = df['ClosePrice'].rolling(20).mean().iloc[-1]
+        curr_close = df['ClosePrice'].iloc[-1]
+        
+        avg_vol = df['Rolling_Vol'].mean()
+        curr_vol = df['Rolling_Vol'].iloc[-1]
+        
+        regime = "Low Volatility" if curr_vol < avg_vol else "High Volatility"
+        signal = "BULLISH" if curr_close > sma20 else "BEARISH"
+        
+        # UI Heatmap Logic
+        if regime == "Low Volatility" and signal == "BULLISH":
+            status = "green"
+        elif regime == "Low Volatility" and signal == "BEARISH":
+            status = "red"
+        else:
+            status = "yellow"
+            
+        results.append({
+            "ticker": ticker,
+            "regime": regime,
+            "signal": signal,
+            "price": round(curr_close, 2),
+            "status": status
+        })
+    return {"scanner": results}
+
+# UPDATED: Analyze Endpoint with Dynamic Slider Parameters
 @app.get("/api/analyze/{ticker}")
-def analyze_stock(ticker: str):
+def analyze_stock(ticker: str, friction: float = Query(0.0015), neutral_band: float = Query(0.05)):
     ticker = ticker.upper()
     if ticker not in UPSTOX_KEYS:
-        raise HTTPException(status_code=400, detail="Ticker not supported. Choose SBIN, RELIANCE, or INFY.")
+        raise HTTPException(status_code=400, detail="Ticker not supported.")
     
-    if not GEMINI_API_KEY or not UPSTOX_ACCESS_TOKEN:
-        raise HTTPException(status_code=500, detail="API Keys are missing on server configuration.")
-
     pooled_data = [generate_hybrid_features(fetch_upstox_data(t)) for t in UPSTOX_KEYS.keys() if not fetch_upstox_data(t).empty]
     if not pooled_data: raise HTTPException(status_code=500, detail="Failed to fetch Upstox data.")
     master_df = pd.concat(pooled_data, ignore_index=True).sort_values('Date').reset_index(drop=True)
@@ -152,11 +187,13 @@ def analyze_stock(ticker: str):
 
     res_df = master_df.iloc[oos_indices].copy()
     res_df['OOS_Pred'] = oos_preds
-    res_df['Friction_Unfilt'] = (res_df['OOS_Pred'].diff().abs().fillna(0)) * FRICTION_COST
+    
+    # Using dynamic friction from slider
+    res_df['Friction_Unfilt'] = (res_df['OOS_Pred'].diff().abs().fillna(0)) * friction
     res_df['Ret_Unfilt'] = (res_df['OOS_Pred'] * res_df['Forward_Return']) - res_df['Friction_Unfilt']
     
     res_df['Pos_Filt'] = np.where(res_df['Regime_Label'] == 'Low Volatility', res_df['OOS_Pred'], 0)
-    res_df['Friction_Filt'] = (res_df['Pos_Filt'].diff().abs().fillna(0)) * FRICTION_COST
+    res_df['Friction_Filt'] = (res_df['Pos_Filt'].diff().abs().fillna(0)) * friction
     res_df['Ret_Filt'] = (res_df['Pos_Filt'] * res_df['Forward_Return']) - res_df['Friction_Filt']
 
     clean_df = res_df.dropna(subset=['Ret_Unfilt', 'Ret_Filt', 'Forward_Return'])
@@ -171,15 +208,15 @@ def analyze_stock(ticker: str):
     live_model = models[best_model_name].fit(X_scaled, y)
     prob_up = live_model.predict_proba(final_scaler.transform(target_df[feature_cols].iloc[[-1]]))[0][1]
 
-    # --- CONVICTION THRESHOLD LOGIC (No-Trade Zone: 45% to 55%) ---
-    if prob_up >= 0.55:
-        quant_signal = "BULLISH"
-    elif prob_up <= 0.45:
-        quant_signal = "BEARISH"
-    else:
-        quant_signal = "NEUTRAL"
+    # Dynamic Conviction Threshold
+    upper_bound = 0.5 + neutral_band
+    lower_bound = 0.5 - neutral_band
+    
+    if prob_up >= upper_bound: quant_signal = "BULLISH"
+    elif prob_up <= lower_bound: quant_signal = "BEARISH"
+    else: quant_signal = "NEUTRAL"
 
-    # --- GEMINI API ENGINE ---
+    # Gemini API Engine
     ai_score, ai_summary = 0.0, "AI Sentiment Unavailable"
     try:
         q = urllib.parse.quote(f"{ticker} stock news India")
@@ -190,9 +227,7 @@ def analyze_stock(ticker: str):
         feed = feedparser.parse(rss_resp.content)
         
         headlines = "\n".join([f"- {h.title}" for h in feed.entries[:10]])
-        
-        if not headlines.strip():
-            raise ValueError("No headlines found.")
+        if not headlines.strip(): raise ValueError("No headlines found.")
 
         client = genai.Client(api_key=GEMINI_API_KEY, http_options=types.HttpOptions(retry_options=types.HttpRetryOptions(initial_delay=1.0, attempts=2)))
         prompt = f"Analyze these recent news headlines for '{ticker}':\n{headlines}\nReturn ONLY a valid JSON: {{\"sentiment_score\": <float -1.0 to 1.0>, \"executive_summary\": \"<1 sentence>\"}}"
@@ -202,7 +237,6 @@ def analyze_stock(ticker: str):
             contents=prompt, 
             config=types.GenerateContentConfig(response_mime_type="application/json")
         )
-        
         match = re.search(r'\{.*\}', resp.text, re.DOTALL)
         ai_json = json.loads(match.group(0)) if match else json.loads(resp.text)
         ai_score = ai_json.get('sentiment_score', 0)
