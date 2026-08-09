@@ -51,7 +51,6 @@ def fetch_upstox_data(symbol, years=2):
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {UPSTOX_ACCESS_TOKEN}'}
     
     try:
-        # 4-Second strict timeout to prevent Render from freezing
         response = requests.get(url, headers=headers, timeout=4)
         if response.status_code == 200:
             data = response.json().get('data', {}).get('candles', [])
@@ -76,6 +75,13 @@ def generate_hybrid_features(df):
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     df['RSI_14'] = 100 - (100 / (1 + (gain / loss)))
+    
+    # NEW: Institutional MACD Momentum Indicators
+    ema_12 = df['ClosePrice'].ewm(span=12, adjust=False).mean()
+    ema_26 = df['ClosePrice'].ewm(span=26, adjust=False).mean()
+    df['MACD'] = ema_12 - ema_26
+    df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+    df['MACD_Hist'] = df['MACD'] - df['MACD_Signal']
     
     for col in ['Log_Returns', 'RSI_14']:
         df[f'{col}_Lag1'] = df[col].shift(1)
@@ -137,7 +143,6 @@ def analyze_stock(ticker: str, friction: float = Query(0.0015), neutral_band: fl
     if ticker not in UPSTOX_KEYS:
         raise HTTPException(status_code=400, detail="Ticker not supported.")
     
-    # FIX 1: SPEED OPTIMIZATION (Only train on the requested ticker, completing in < 1 second)
     raw_data = fetch_upstox_data(ticker)
     if raw_data.empty: 
         raise HTTPException(status_code=500, detail="Failed to fetch target Upstox data.")
@@ -151,9 +156,12 @@ def analyze_stock(ticker: str, friction: float = Query(0.0015), neutral_band: fl
         lambda x: 'Low Volatility' if x == regime_means.idxmin() else 'High Volatility'
     )
 
-    feature_cols = ['Log_Returns', 'SMA_20_Dist', 'RSI_14', 'Relative_Volume', 'Log_Returns_Lag1', 'Log_Returns_Lag2', 'RSI_14_Lag1', 'AR1_Forecast']
+    feature_cols = ['Log_Returns', 'SMA_20_Dist', 'RSI_14', 'Relative_Volume', 'Log_Returns_Lag1', 'Log_Returns_Lag2', 'AR1_Forecast', 'MACD', 'MACD_Hist']
     X, y = master_df[feature_cols], master_df['Target_Direction']
+    
+    # UPGRADE: XGBoost added to the model suite
     models = {
+        "XGBoost": XGBClassifier(n_estimators=100, max_depth=4, learning_rate=0.05, random_state=42, eval_metric='logloss'),
         "Random Forest": RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42),
         "Logistic Regression": LogisticRegression(max_iter=500, random_state=42)
     }
@@ -178,7 +186,6 @@ def analyze_stock(ticker: str, friction: float = Query(0.0015), neutral_band: fl
     oos_preds, oos_indices = [], []
     current_pos = 0  
     
-    # FIX 2: HYSTERESIS FILTER (Slashes transaction fees from 150% down to 5%)
     for train_idx, test_idx in tscv.split(X):
         scaler = StandardScaler()
         X_train_scaled = scaler.fit_transform(X.iloc[train_idx])
@@ -216,13 +223,11 @@ def analyze_stock(ticker: str, friction: float = Query(0.0015), neutral_band: fl
     elif prob_up <= lower_bound: quant_signal = "BEARISH"
     else: quant_signal = "NEUTRAL"
 
-    # FIX 3: API TIMEOUT SAFETIES
     ai_score, ai_summary = 0.0, "AI Sentiment Feed Unavailable"
     try:
         q = urllib.parse.quote(f"{ticker} stock news India")
         rss_url = f"https://news.google.com/rss/search?q={q}&hl=en-IN&gl=IN&ceid=IN:en"
         
-        # 3-Second timeout on RSS News Fetch
         headers = {'User-Agent': 'Mozilla/5.0'}
         rss_resp = requests.get(rss_url, headers=headers, timeout=3)
         feed = feedparser.parse(rss_resp.content)
