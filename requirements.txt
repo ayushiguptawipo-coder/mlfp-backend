@@ -9,3 +9,4 @@ lightgbm
 catboost
 feedparser
 google-genai
+yfinance
