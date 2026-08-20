@@ -5,5 +5,7 @@ pandas
 numpy
 scikit-learn
 xgboost
+lightgbm
+catboost
 feedparser
 google-genai
