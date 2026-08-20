@@ -10,10 +10,12 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from xgboost import XGBClassifier
+from lightgbm import LGBMClassifier
+from catboost import CatBoostClassifier
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.cluster import KMeans
-from sklearn.metrics import accuracy_score, roc_auc_score
+from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import Ridge
@@ -21,11 +23,11 @@ from google import genai
 from google.genai import types
 from datetime import datetime, timedelta
 
-# SECURE ENVIRONMENT VARIABLES 
+# SECURE ENVIRONMENT VARIABLES
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 UPSTOX_ACCESS_TOKEN = os.environ.get("UPSTOX_ACCESS_TOKEN")
 
-app = FastAPI(title="MLFP Quant Engine API")
+app = FastAPI(title="MLFP Quant Engine Pro API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -35,7 +37,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- GLOBAL CRASH HANDLER ---
+# Global Crash Handler with CORS preservation
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     return JSONResponse(
@@ -53,7 +55,7 @@ UPSTOX_KEYS = {
     'ICICIBANK': 'NSE_EQ|INE090A01021'
 }
 
-def fetch_upstox_data(symbol, years=2):
+def fetch_upstox_data(symbol, years=3):
     instrument_key = UPSTOX_KEYS.get(symbol)
     to_date = datetime.now().strftime('%Y-%m-%d')
     from_date = (datetime.now() - timedelta(days=365 * years)).strftime('%Y-%m-%d')
@@ -61,13 +63,13 @@ def fetch_upstox_data(symbol, years=2):
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {UPSTOX_ACCESS_TOKEN}'}
     
     try:
-        response = requests.get(url, headers=headers, timeout=5)
+        response = requests.get(url, headers=headers, timeout=6)
         if response.status_code == 200:
             data = response.json().get('data', {}).get('candles', [])
             if not data: return pd.DataFrame()
             df = pd.DataFrame(data, columns=['Date', 'Open', 'High', 'Low', 'ClosePrice', 'Volume', 'OI'])
             df['Date'] = pd.to_datetime(df['Date']).dt.tz_localize(None)
-            return df.sort_values('Date').reset_index(drop=True)[['Date', 'ClosePrice', 'Volume']]
+            return df.sort_values('Date').reset_index(drop=True)[['Date', 'Open', 'High', 'Low', 'ClosePrice', 'Volume']]
     except Exception:
         pass
     return pd.DataFrame()
@@ -77,10 +79,15 @@ def generate_hybrid_features(df):
     df['Log_Returns'] = np.log(df['ClosePrice'] / df['ClosePrice'].shift(1)).replace([np.inf, -np.inf], np.nan).fillna(0)
     df['Forward_Return'] = np.log(df['ClosePrice'].shift(-1) / df['ClosePrice'])
     
-    sma_20_raw = df['ClosePrice'].rolling(window=20).mean()
-    df['SMA_20_Dist'] = (df['ClosePrice'] - sma_20_raw) / sma_20_raw
+    # 1. Macro Trend Features (Anti-Counter-Trend Protection)
+    sma_200 = df['ClosePrice'].rolling(window=200, min_periods=50).mean()
+    df['Macro_Bull_Trend'] = (df['ClosePrice'] > sma_200).astype(int)
+    
+    sma_20 = df['ClosePrice'].rolling(window=20).mean()
+    df['SMA_20_Dist'] = (df['ClosePrice'] - sma_20) / sma_20
     df['Relative_Volume'] = df['Volume'] / df['Volume'].rolling(window=20).mean()
     
+    # 2. Momentum Indicators
     delta = df['ClosePrice'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
@@ -92,7 +99,14 @@ def generate_hybrid_features(df):
     df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
     df['MACD_Hist'] = df['MACD'] - df['MACD_Signal']
     
-    for col in ['Log_Returns', 'RSI_14']:
+    # 3. Volatility & True Range
+    high_low = df['High'] - df['Low']
+    high_close = (df['High'] - df['ClosePrice'].shift()).abs()
+    low_close = (df['Low'] - df['ClosePrice'].shift()).abs()
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    df['ATR_14'] = tr.rolling(window=14).mean() / df['ClosePrice']
+    
+    for col in ['Log_Returns', 'RSI_14', 'MACD_Hist']:
         df[f'{col}_Lag1'] = df[col].shift(1)
         df[f'{col}_Lag2'] = df[col].shift(2)
         
@@ -103,7 +117,7 @@ def generate_hybrid_features(df):
             window = returns_series[max(0, i-30):i]
             X_ar, y_ar = window[:-1].reshape(-1, 1), window[1:]
             if len(X_ar) > 5 and not np.isnan(X_ar).any() and not np.isnan(y_ar).any():
-                reg = Ridge(alpha=1.0).fit(X_ar, y_ar)
+                reg = Ridge(alpha=2.0).fit(X_ar, y_ar)
                 ar_preds.append(reg.predict(window[-1].reshape(1, -1))[0])
             else: ar_preds.append(0.0)
                 
@@ -112,10 +126,9 @@ def generate_hybrid_features(df):
     df['Rolling_Vol'] = df['Log_Returns'].rolling(window=10).std()
     return df.dropna().reset_index(drop=True)
 
-# --- FIX: Accept both GET and HEAD requests so Render's health check passes ---
 @app.api_route("/", methods=["GET", "HEAD"])
 def home():
-    return {"status": "MLFP Quant Engine API is online."}
+    return {"status": "MLFP Quant Engine Pro API is online."}
 
 @app.get("/api/scanner")
 def get_market_scanner():
@@ -155,7 +168,7 @@ def analyze_stock(ticker: str, friction: float = Query(0.0015), neutral_band: fl
     
     raw_data = fetch_upstox_data(ticker)
     if raw_data.empty: 
-        raise HTTPException(status_code=400, detail=f"Upstox API failed to return data for {ticker}. The data source might be timing out.")
+        raise HTTPException(status_code=400, detail=f"Upstox data feed timed out for {ticker}.")
         
     master_df = generate_hybrid_features(raw_data)
 
@@ -167,13 +180,20 @@ def analyze_stock(ticker: str, friction: float = Query(0.0015), neutral_band: fl
         lambda x: 'Low Volatility' if x == regime_means.idxmin() else 'High Volatility'
     )
 
-    feature_cols = ['Log_Returns', 'SMA_20_Dist', 'RSI_14', 'Relative_Volume', 'Log_Returns_Lag1', 'Log_Returns_Lag2', 'AR1_Forecast', 'MACD', 'MACD_Hist']
+    feature_cols = [
+        'Log_Returns', 'SMA_20_Dist', 'RSI_14', 'Relative_Volume', 
+        'Log_Returns_Lag1', 'Log_Returns_Lag2', 'AR1_Forecast', 
+        'MACD', 'MACD_Hist', 'ATR_14'
+    ]
     X, y = master_df[feature_cols], master_df['Target_Direction']
     
+    # 5-Model Institutional Bake-Off (Strict Regularization against Overfitting)
     models = {
-        "XGBoost": XGBClassifier(n_estimators=100, max_depth=4, learning_rate=0.05, random_state=42, eval_metric='logloss'),
-        "Random Forest": RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42),
-        "Logistic Regression": LogisticRegression(max_iter=500, random_state=42)
+        "CatBoost": CatBoostClassifier(depth=3, iterations=60, learning_rate=0.03, l2_leaf_reg=3.0, verbose=0, random_seed=42),
+        "LightGBM": LGBMClassifier(max_depth=3, n_estimators=50, learning_rate=0.03, subsample=0.8, reg_alpha=1.0, reg_lambda=1.0, verbose=-1, random_state=42),
+        "XGBoost": XGBClassifier(max_depth=3, n_estimators=50, learning_rate=0.03, subsample=0.8, colsample_bytree=0.8, reg_alpha=1.0, reg_lambda=1.0, random_state=42, eval_metric='logloss'),
+        "Random Forest": RandomForestClassifier(n_estimators=60, max_depth=4, min_samples_leaf=8, random_state=42),
+        "Logistic Regression": LogisticRegression(C=0.1, max_iter=500, random_state=42)
     }
     
     results = {name: {'auc': []} for name in models.keys()}
@@ -189,12 +209,13 @@ def analyze_stock(ticker: str, friction: float = Query(0.0015), neutral_band: fl
         for name, model in models.items():
             model.fit(X_train_scaled, y_train)
             try: results[name]['auc'].append(roc_auc_score(y_test, model.predict_proba(X_test_scaled)[:, 1]))
-            except: results[name]['auc'].append(0.5)
+            except Exception: results[name]['auc'].append(0.5)
 
     best_model_name = max(results, key=lambda k: np.mean(results[k]['auc']))
     
-    oos_preds, oos_indices = [], []
-    current_pos = 0  
+    # Out-of-Sample Simulation with Sizing & Trend Guardrail
+    oos_positions, oos_indices = [], []
+    current_pos = 0.0
     
     for train_idx, test_idx in tscv.split(X):
         scaler = StandardScaler()
@@ -203,22 +224,38 @@ def analyze_stock(ticker: str, friction: float = Query(0.0015), neutral_band: fl
         model = models[best_model_name].fit(X_train_scaled, y.iloc[train_idx])
         
         probs = model.predict_proba(X_test_scaled)[:, 1]
-        for p in probs:
-            if p > 0.55: current_pos = 1
-            elif p < 0.45: current_pos = 0
-            oos_preds.append(current_pos)
-            
+        macro_trends = master_df['Macro_Bull_Trend'].iloc[test_idx].values
+        
+        for p, is_bull_trend in zip(probs, macro_trends):
+            # Dynamic Conviction Sizing
+            if p > (0.50 + neutral_band):
+                conviction = (p - 0.50) / 0.50
+                target_alloc = 0.30 if conviction < 0.25 else (0.65 if conviction < 0.50 else 1.00)
+                current_pos = target_alloc
+            elif p < (0.50 - neutral_band):
+                # Guardrail: Never short during a Macro Bull Trend
+                if is_bull_trend == 1:
+                    current_pos = 0.0
+                else:
+                    conviction = (0.50 - p) / 0.50
+                    target_alloc = 0.30 if conviction < 0.25 else (0.65 if conviction < 0.50 else 1.00)
+                    current_pos = -target_alloc
+            else:
+                current_pos = 0.0
+                
+            oos_positions.append(current_pos)
         oos_indices.extend(test_idx)
 
     res_df = master_df.iloc[oos_indices].copy()
-    res_df['OOS_Pred'] = oos_preds
+    res_df['Position_Unfilt'] = oos_positions
     
-    res_df['Friction_Unfilt'] = (res_df['OOS_Pred'].diff().abs().fillna(0)) * friction
-    res_df['Ret_Unfilt'] = (res_df['OOS_Pred'] * res_df['Forward_Return']) - res_df['Friction_Unfilt']
+    res_df['Friction_Unfilt'] = (res_df['Position_Unfilt'].diff().abs().fillna(0)) * friction
+    res_df['Ret_Unfilt'] = (res_df['Position_Unfilt'] * res_df['Forward_Return']) - res_df['Friction_Unfilt']
     
-    res_df['Pos_Filt'] = np.where(res_df['Regime_Label'] == 'Low Volatility', res_df['OOS_Pred'], 0)
-    res_df['Friction_Filt'] = (res_df['Pos_Filt'].diff().abs().fillna(0)) * friction
-    res_df['Ret_Filt'] = (res_df['Pos_Filt'] * res_df['Forward_Return']) - res_df['Friction_Filt']
+    # Low-volatility regime gating
+    res_df['Position_Filt'] = np.where(res_df['Regime_Label'] == 'Low Volatility', res_df['Position_Unfilt'], 0.0)
+    res_df['Friction_Filt'] = (res_df['Position_Filt'].diff().abs().fillna(0)) * friction
+    res_df['Ret_Filt'] = (res_df['Position_Filt'] * res_df['Forward_Return']) - res_df['Friction_Filt']
 
     clean_df = res_df.dropna(subset=['Ret_Unfilt', 'Ret_Filt', 'Forward_Return'])
     
@@ -229,11 +266,16 @@ def analyze_stock(ticker: str, friction: float = Query(0.0015), neutral_band: fl
 
     upper_bound = 0.5 + neutral_band
     lower_bound = 0.5 - neutral_band
-    if prob_up >= upper_bound: quant_signal = "BULLISH"
-    elif prob_up <= lower_bound: quant_signal = "BEARISH"
-    else: quant_signal = "NEUTRAL"
+    is_macro_bull = master_df['Macro_Bull_Trend'].iloc[-1] == 1
+    
+    if prob_up >= upper_bound:
+        quant_signal = "BULLISH"
+    elif prob_up <= lower_bound:
+        quant_signal = "NEUTRAL (Macro Bull Guard)" if is_macro_bull else "BEARISH"
+    else:
+        quant_signal = "NEUTRAL"
 
-    # --- GEMINI API ENGINE WITH QUOTE SAFETY ---
+    # Gemini Sentiment Engine with Quote Protection
     ai_score, ai_summary = 0.0, "AI Sentiment Feed Unavailable"
     try:
         q = urllib.parse.quote(f"{ticker} stock news India")
@@ -246,31 +288,26 @@ def analyze_stock(ticker: str, friction: float = Query(0.0015), neutral_band: fl
         headlines = "\n".join([f"- {h.title}" for h in feed.entries[:10]])
         if headlines.strip():
             client = genai.Client(api_key=GEMINI_API_KEY)
-            
-            prompt = f"Analyze these recent news headlines for '{ticker}':\n{headlines}\nReturn ONLY a valid JSON: {{\"sentiment_score\": <float -1.0 to 1.0>, \"executive_summary\": \"<1 sentence summary. DO NOT use any double quotes inside this sentence.>\"}}"
+            prompt = f"Analyze these recent news headlines for '{ticker}':\n{headlines}\nReturn ONLY a valid JSON: {{\"sentiment_score\": <float -1.0 to 1.0>, \"executive_summary\": \"<1 sentence summary without any double quotes inside>\"}}"
             
             resp = client.models.generate_content(
                 model='gemini-3.5-flash', 
                 contents=prompt, 
                 config=types.GenerateContentConfig(response_mime_type="application/json")
             )
-            
             raw_text = resp.text.strip()
             match = re.search(r'\{.*\}', raw_text, re.DOTALL)
-            clean_json_string = match.group(0) if match else raw_text
+            clean_json = match.group(0) if match else raw_text
             
             try:
-                ai_json = json.loads(clean_json_string)
+                ai_json = json.loads(clean_json)
             except Exception:
-                ai_json = {
-                    "sentiment_score": 0.0, 
-                    "executive_summary": clean_json_string.replace('"', "'").replace('\n', ' ')
-                }
+                ai_json = {"sentiment_score": 0.0, "executive_summary": clean_json.replace('"', "'").replace('\n', ' ')}
                 
             ai_score = ai_json.get('sentiment_score', 0.0)
             ai_summary = ai_json.get('executive_summary', "No summary provided.")
     except Exception as e:
-        ai_summary = f"API Diagnostic: News parser failed. ({str(e)})"
+        ai_summary = f"News parser diagnostic: {str(e)}"
 
     return {
         "ticker": str(ticker),
@@ -281,8 +318,8 @@ def analyze_stock(ticker: str, friction: float = Query(0.0015), neutral_band: fl
         "ai_sentiment_score": float(ai_score),
         "ai_summary": str(ai_summary),
         "diagnostics": {
-            "unfiltered_trades": int(clean_df['OOS_Pred'].diff().abs().sum()),
-            "filtered_trades": int(clean_df['Pos_Filt'].diff().abs().sum()),
+            "unfiltered_trades": int(clean_df['Position_Unfilt'].diff().abs().gt(0).sum()),
+            "filtered_trades": int(clean_df['Position_Filt'].diff().abs().gt(0).sum()),
             "unfiltered_friction_pct": float(round(float(clean_df['Friction_Unfilt'].sum()) * 100, 2)),
             "filtered_friction_pct": float(round(float(clean_df['Friction_Filt'].sum()) * 100, 2))
         },
