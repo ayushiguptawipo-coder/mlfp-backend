@@ -55,7 +55,6 @@ UPSTOX_KEYS = {
     'ICICIBANK': 'NSE_EQ|INE090A01021'
 }
 
-# --- JSON SANITIZER HELPER ---
 def safe_float(val, default=0.0):
     try:
         if val is None or pd.isna(val) or np.isnan(float(val)) or np.isinf(float(val)):
@@ -118,14 +117,12 @@ def fetch_upstox_data_dynamic(instrument_key, years=3):
         pass
     return pd.DataFrame()
 
-# --- ROBUST INSTITUTIONAL FUNDAMENTALS ENGINE ---
 def calculate_institutional_fundamentals(ticker: str):
     default_response = {
         "altman_z": {"score": 0.0, "zone": "Data Unavailable", "status": "grey", "desc": "Balance sheet metrics could not be retrieved."},
         "dupont": {"roe": 0.0, "profit_margin": 0.0, "asset_turnover": 0.0, "financial_leverage": 0.0, "verdict": "Unavailable"},
         "eva": {"eva_cr": 0.0, "nopat_cr": 0.0, "wacc_pct": 0.0, "invested_capital_cr": 0.0, "status": "Neutral", "verdict": "Unavailable"}
     }
-    
     try:
         clean_sym = ticker.upper().replace(".NS", "").replace(".BO", "")
         stock = yf.Ticker(f"{clean_sym}.NS")
@@ -166,7 +163,6 @@ def calculate_institutional_fundamentals(ticker: str):
         net_income = safe_float(latest_fin.get('Net Income', latest_fin.get('Net Income Common Stockholders')), revenue * 0.10)
         market_cap = safe_float(info.get('marketCap'), total_equity * 2.0)
 
-        # 1. ALTMAN Z-SCORE
         x1 = working_capital / total_assets
         x2 = retained_earnings / total_assets
         x3 = ebit / total_assets
@@ -181,7 +177,6 @@ def calculate_institutional_fundamentals(ticker: str):
         else:
             z_zone, z_status, z_desc = "Distress Zone", "red", "High financial stress. Balance sheet carries significant default risk."
 
-        # 2. DUPONT ANALYSIS (3-Stage)
         net_margin = (net_income / revenue) if revenue > 0 else 0.0
         asset_turnover = (revenue / total_assets) if total_assets > 0 else 0.0
         fin_leverage = (total_assets / total_equity) if total_equity > 0 else 1.0
@@ -194,7 +189,6 @@ def calculate_institutional_fundamentals(ticker: str):
         else:
             dupont_verdict = "Asset Velocity Engine (ROE driven by asset turnover & volume)"
 
-        # 3. ECONOMIC VALUE ADDED (EVA)
         tax_rate = 0.25
         nopat = ebit * (1 - tax_rate)
         invested_capital = total_equity + total_debt
@@ -225,27 +219,9 @@ def calculate_institutional_fundamentals(ticker: str):
             eva_verdict = f"Consumes ₹{abs(eva_cr)} Cr in capital, earning below its {round(wacc_pct, 1)}% hurdle rate."
 
         return {
-            "altman_z": {
-                "score": z_score,
-                "zone": z_zone,
-                "status": z_status,
-                "desc": z_desc
-            },
-            "dupont": {
-                "roe": safe_float(round(roe * 100, 2), 0.0),
-                "profit_margin": safe_float(round(net_margin * 100, 2), 0.0),
-                "asset_turnover": safe_float(round(asset_turnover, 2), 0.0),
-                "financial_leverage": safe_float(round(fin_leverage, 2), 1.0),
-                "verdict": dupont_verdict
-            },
-            "eva": {
-                "eva_cr": eva_cr,
-                "nopat_cr": nopat_cr,
-                "wacc_pct": wacc_pct,
-                "invested_capital_cr": inv_cap_cr,
-                "status": eva_status,
-                "verdict": eva_verdict
-            }
+            "altman_z": {"score": z_score, "zone": z_zone, "status": z_status, "desc": z_desc},
+            "dupont": {"roe": safe_float(round(roe * 100, 2), 0.0), "profit_margin": safe_float(round(net_margin * 100, 2), 0.0), "asset_turnover": safe_float(round(asset_turnover, 2), 0.0), "financial_leverage": safe_float(round(fin_leverage, 2), 1.0), "verdict": dupont_verdict},
+            "eva": {"eva_cr": eva_cr, "nopat_cr": nopat_cr, "wacc_pct": wacc_pct, "invested_capital_cr": inv_cap_cr, "status": eva_status, "verdict": eva_verdict}
         }
     except Exception:
         return default_response
@@ -254,35 +230,28 @@ def generate_hybrid_features(df):
     df = df.copy()
     df['Log_Returns'] = np.log(df['ClosePrice'] / df['ClosePrice'].shift(1)).replace([np.inf, -np.inf], np.nan).fillna(0)
     df['Forward_Return'] = np.log(df['ClosePrice'].shift(-1) / df['ClosePrice'])
-    
     sma_200 = df['ClosePrice'].rolling(window=200, min_periods=50).mean()
     df['Macro_Bull_Trend'] = (df['ClosePrice'] > sma_200).astype(int)
-    
     sma_20 = df['ClosePrice'].rolling(window=20).mean()
     df['SMA_20_Dist'] = (df['ClosePrice'] - sma_20) / sma_20
     df['Relative_Volume'] = df['Volume'] / df['Volume'].rolling(window=20).mean()
-    
     delta = df['ClosePrice'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     df['RSI_14'] = 100 - (100 / (1 + (gain / loss)))
-    
     ema_12 = df['ClosePrice'].ewm(span=12, adjust=False).mean()
     ema_26 = df['ClosePrice'].ewm(span=26, adjust=False).mean()
     df['MACD'] = ema_12 - ema_26
     df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
     df['MACD_Hist'] = df['MACD'] - df['MACD_Signal']
-    
     high_low = df['High'] - df['Low']
     high_close = (df['High'] - df['ClosePrice'].shift()).abs()
     low_close = (df['Low'] - df['ClosePrice'].shift()).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df['ATR_14'] = tr.rolling(window=14).mean() / df['ClosePrice']
-    
     for col in ['Log_Returns', 'RSI_14', 'MACD_Hist']:
         df[f'{col}_Lag1'] = df[col].shift(1)
         df[f'{col}_Lag2'] = df[col].shift(2)
-        
     ar_preds, returns_series = [], df['Log_Returns'].values
     for i in range(len(df)):
         if i < 20: ar_preds.append(np.nan)
@@ -293,11 +262,9 @@ def generate_hybrid_features(df):
                 reg = Ridge(alpha=2.0).fit(X_ar, y_ar)
                 ar_preds.append(reg.predict(window[-1].reshape(1, -1))[0])
             else: ar_preds.append(0.0)
-                
     df['AR1_Forecast'] = ar_preds
     df['Target_Direction'] = (df['Forward_Return'] > 0).astype(int)
     df['Rolling_Vol'] = df['Log_Returns'].rolling(window=10).std()
-    
     clean_df = df.dropna(subset=['Log_Returns_Lag2', 'RSI_14', 'MACD', 'ATR_14', 'AR1_Forecast']).reset_index(drop=True)
     return clean_df
 
@@ -317,11 +284,7 @@ def search_stock(q: str):
             results = []
             for item in data:
                 if item.get('segment') in ['NSE_EQ', 'BSE_EQ']:
-                    results.append({
-                        "ticker": item.get('trading_symbol'),
-                        "name": item.get('name'),
-                        "instrument_key": item.get('instrument_key')
-                    })
+                    results.append({"ticker": item.get('trading_symbol'), "name": item.get('name'), "instrument_key": item.get('instrument_key')})
             unique_results = {}
             for r in results:
                 if r['ticker'] not in unique_results:
@@ -336,50 +299,32 @@ def get_market_scanner():
     keys = list(UPSTOX_KEYS.values())
     quotes = fetch_live_quote(keys)
     results = []
-    
     for ticker, instr_key in UPSTOX_KEYS.items():
         df = fetch_upstox_data_dynamic(instr_key, years=1)
         if df.empty or len(df) < 30: continue
-        
         df['Rolling_Vol'] = np.log(df['ClosePrice'] / df['ClosePrice'].shift(1)).replace([np.inf, -np.inf], np.nan).fillna(0).rolling(10).std()
         sma20 = df['ClosePrice'].rolling(20).mean().iloc[-1]
-        
         q_data = extract_quote_data(quotes, ticker, instr_key)
         live_price = safe_float(q_data.get('last_price', df['ClosePrice'].iloc[-1]))
         change_val = safe_float(q_data.get('net_change', 0.0))
-        
         avg_vol = df['Rolling_Vol'].mean()
         curr_vol = df['Rolling_Vol'].iloc[-1]
-        
         regime = "Low Volatility" if curr_vol < avg_vol else "High Volatility"
         signal = "BULLISH" if live_price > sma20 else "BEARISH"
-        
         if regime == "Low Volatility" and signal == "BULLISH": status = "green"
         elif regime == "Low Volatility" and signal == "BEARISH": status = "red"
         else: status = "yellow"
-            
-        results.append({
-            "ticker": str(ticker),
-            "regime": str(regime),
-            "signal": str(signal),
-            "price": float(round(live_price, 2)),
-            "change_val": float(round(change_val, 2)),
-            "status": str(status)
-        })
+        results.append({"ticker": str(ticker), "regime": str(regime), "signal": str(signal), "price": float(round(live_price, 2)), "change_val": float(round(change_val, 2)), "status": str(status)})
     return sanitize_json({"scanner": results})
 
 @app.get("/api/analyze/{ticker}")
 def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: float = Query(0.0015), neutral_band: float = Query(0.05)):
     ticker = ticker.upper()
-    if not instrument_key:
-        instrument_key = UPSTOX_KEYS.get(ticker)
-        
-    if not instrument_key:
-        raise HTTPException(status_code=400, detail="Instrument Key missing. Please select from search.")
+    if not instrument_key: instrument_key = UPSTOX_KEYS.get(ticker)
+    if not instrument_key: raise HTTPException(status_code=400, detail="Instrument Key missing.")
         
     raw_data = fetch_upstox_data_dynamic(instrument_key, years=3)
-    if raw_data.empty: 
-        raise HTTPException(status_code=400, detail=f"Data feed timed out or returned empty for {ticker}.")
+    if raw_data.empty: raise HTTPException(status_code=400, detail=f"Data feed timed out.")
         
     live_quotes = fetch_live_quote([instrument_key])
     quote_info = extract_quote_data(live_quotes, ticker, instrument_key)
@@ -391,35 +336,55 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
     current_day_open = safe_float(quote_info.get('ohlc', {}).get('open', current_live_price))
     current_day_volume = safe_float(quote_info.get('volume', raw_data['Volume'].iloc[-1]))
 
-    # Stitch live row before features
     today_dt = pd.to_datetime(datetime.now().date())
     if raw_data['Date'].iloc[-1].date() < today_dt.date():
-        today_row = pd.DataFrame([{
-            'Date': today_dt,
-            'Open': current_day_open,
-            'High': max(current_day_high, current_live_price),
-            'Low': min(current_day_low, current_live_price),
-            'ClosePrice': current_live_price,
-            'Volume': current_day_volume
-        }])
+        today_row = pd.DataFrame([{'Date': today_dt, 'Open': current_day_open, 'High': max(current_day_high, current_live_price), 'Low': min(current_day_low, current_live_price), 'ClosePrice': current_live_price, 'Volume': current_day_volume}])
         raw_data = pd.concat([raw_data, today_row], ignore_index=True)
 
-    master_df = generate_hybrid_features(raw_data)
+    # --- 1-YEAR FORECAST LOGIC (Log-Linear Extrapolation & Probability Cone) ---
+    forecast_payload = None
+    try:
+        hist_closes = raw_data['ClosePrice'].values
+        hist_dates = raw_data['Date']
+        
+        daily_returns = np.log(hist_closes[1:] / hist_closes[:-1])
+        volatility = np.std(daily_returns)
+        
+        x_hist = np.arange(len(hist_closes))
+        log_prices = np.log(hist_closes)
+        poly_coeffs = np.polyfit(x_hist, log_prices, deg=1)
+        
+        forecast_days = 252
+        x_future = np.arange(len(hist_closes), len(hist_closes) + forecast_days)
+        forecast_log = np.polyval(poly_coeffs, x_future)
+        forecast_path = np.exp(forecast_log)
+        
+        expanding_std = volatility * np.sqrt(np.arange(1, forecast_days + 1))
+        upper_bound = forecast_path * np.exp(1.96 * expanding_std)
+        lower_bound = forecast_path * np.exp(-1.96 * expanding_std)
+        
+        last_date = hist_dates.iloc[-1]
+        future_dates = pd.bdate_range(start=last_date + pd.Timedelta(days=1), periods=forecast_days)
+        
+        forecast_payload = {
+            "historical_dates": [str(d.date()) for d in hist_dates],
+            "historical_prices": [round(p, 2) for p in hist_closes],
+            "future_dates": [str(d.date()) for d in future_dates],
+            "expected_path": [round(p, 2) for p in forecast_path],
+            "upper_bound": [round(p, 2) for p in upper_bound],
+            "lower_bound": [round(p, 2) for p in lower_bound]
+        }
+    except Exception:
+        forecast_payload = None
 
+    master_df = generate_hybrid_features(raw_data)
     log_vol = np.log(master_df[['Rolling_Vol']] + 1e-8)
     scaled_vol = StandardScaler().fit_transform(log_vol)
     master_df['Volatility_Regime'] = KMeans(n_clusters=2, random_state=42, n_init=10).fit_predict(scaled_vol)
     regime_means = master_df.groupby('Volatility_Regime')['Rolling_Vol'].mean()
-    master_df['Regime_Label'] = master_df['Volatility_Regime'].apply(
-        lambda x: 'Low Volatility' if x == regime_means.idxmin() else 'High Volatility'
-    )
+    master_df['Regime_Label'] = master_df['Volatility_Regime'].apply(lambda x: 'Low Volatility' if x == regime_means.idxmin() else 'High Volatility')
 
-    feature_cols = [
-        'Log_Returns', 'SMA_20_Dist', 'RSI_14', 'Relative_Volume', 
-        'Log_Returns_Lag1', 'Log_Returns_Lag2', 'AR1_Forecast', 
-        'MACD', 'MACD_Hist', 'ATR_14'
-    ]
-    
+    feature_cols = ['Log_Returns', 'SMA_20_Dist', 'RSI_14', 'Relative_Volume', 'Log_Returns_Lag1', 'Log_Returns_Lag2', 'AR1_Forecast', 'MACD', 'MACD_Hist', 'ATR_14']
     hist_train_df = master_df.iloc[:-1].copy()
     X_hist, y_hist = hist_train_df[feature_cols], hist_train_df['Target_Direction']
     
@@ -440,7 +405,6 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
         scaler = StandardScaler()
         X_train_scaled = scaler.fit_transform(X_train)
         X_test_scaled = scaler.transform(X_test)
-        
         for name, model in models.items():
             model.fit(X_train_scaled, y_train)
             try: results[name]['auc'].append(roc_auc_score(y_test, model.predict_proba(X_test_scaled)[:, 1]))
@@ -454,98 +418,65 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
         X_train_scaled = scaler.fit_transform(X_hist.iloc[train_idx])
         X_test_scaled = scaler.transform(X_hist.iloc[test_idx])
         model = models[best_model_name].fit(X_train_scaled, y_hist.iloc[train_idx])
-        
         probs = model.predict_proba(X_test_scaled)[:, 1]
         macro_trends = hist_train_df['Macro_Bull_Trend'].iloc[test_idx].values
-        
         for p, is_bull_trend in zip(probs, macro_trends):
             if p > (0.50 + neutral_band):
-                conviction = (p - 0.50) / 0.50
-                target_alloc = 0.30 if conviction < 0.25 else (0.65 if conviction < 0.50 else 1.00)
+                target_alloc = 0.30 if ((p - 0.5) / 0.5) < 0.25 else (0.65 if ((p - 0.5) / 0.5) < 0.50 else 1.00)
                 oos_positions.append(target_alloc)
             elif p < (0.50 - neutral_band):
-                if is_bull_trend == 1:
-                    oos_positions.append(0.0)
+                if is_bull_trend == 1: oos_positions.append(0.0)
                 else:
-                    conviction = (0.50 - p) / 0.50
-                    target_alloc = 0.30 if conviction < 0.25 else (0.65 if conviction < 0.50 else 1.00)
+                    target_alloc = 0.30 if ((0.5 - p) / 0.5) < 0.25 else (0.65 if ((0.5 - p) / 0.5) < 0.50 else 1.00)
                     oos_positions.append(-target_alloc)
-            else:
-                oos_positions.append(0.0)
+            else: oos_positions.append(0.0)
         oos_indices.extend(test_idx)
 
     res_df = hist_train_df.iloc[oos_indices].copy()
     res_df['Position_Unfilt'] = oos_positions
     res_df['Friction_Unfilt'] = (res_df['Position_Unfilt'].diff().abs().fillna(0)) * friction
     res_df['Ret_Unfilt'] = (res_df['Position_Unfilt'] * res_df['Forward_Return']) - res_df['Friction_Unfilt']
-    
     res_df['Position_Filt'] = np.where(res_df['Regime_Label'] == 'Low Volatility', res_df['Position_Unfilt'], 0.0)
     res_df['Friction_Filt'] = (res_df['Position_Filt'].diff().abs().fillna(0)) * friction
     res_df['Ret_Filt'] = (res_df['Position_Filt'] * res_df['Forward_Return']) - res_df['Friction_Filt']
-
     clean_df = res_df.dropna(subset=['Ret_Unfilt', 'Ret_Filt', 'Forward_Return'])
     
     final_scaler = StandardScaler()
     X_scaled = final_scaler.fit_transform(X_hist)
     live_model = models[best_model_name].fit(X_scaled, y_hist)
-    
     live_features_today = final_scaler.transform(master_df[feature_cols].iloc[[-1]])
     prob_up = live_model.predict_proba(live_features_today)[0][1]
 
     upper_bound = 0.5 + neutral_band
     lower_bound = 0.5 - neutral_band
     is_macro_bull = master_df['Macro_Bull_Trend'].iloc[-1] == 1
-    
-    if prob_up >= upper_bound:
-        quant_signal = "BULLISH"
-    elif prob_up <= lower_bound:
-        quant_signal = "NEUTRAL (Macro Bull Guard)" if is_macro_bull else "BEARISH"
-    else:
-        quant_signal = "NEUTRAL"
+    if prob_up >= upper_bound: quant_signal = "BULLISH"
+    elif prob_up <= lower_bound: quant_signal = "NEUTRAL (Macro Bull Guard)" if is_macro_bull else "BEARISH"
+    else: quant_signal = "NEUTRAL"
 
-    # Gemini News Catalyst
-    ai_score, ai_summary = 0.0, "AI Sentiment Feed Unavailable"
     try:
         q = urllib.parse.quote(f"{ticker} stock news India")
         rss_url = f"https://news.google.com/rss/search?q={q}&hl=en-IN&gl=IN&ceid=IN:en"
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        rss_resp = requests.get(rss_url, headers=headers, timeout=3)
-        feed = feedparser.parse(rss_resp.content)
-        
+        feed = feedparser.parse(requests.get(rss_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3).content)
         headlines = "\n".join([f"- {h.title}" for h in feed.entries[:10]])
         if headlines.strip():
             client = genai.Client(api_key=GEMINI_API_KEY)
-            prompt = f"Analyze these recent news headlines for '{ticker}':\n{headlines}\nReturn ONLY a valid JSON: {{\"sentiment_score\": <float -1.0 to 1.0>, \"executive_summary\": \"<1 sentence summary without any double quotes inside>\"}}"
-            
             resp = client.models.generate_content(
-                model='gemini-3.5-flash', 
-                contents=prompt, 
-                config=types.GenerateContentConfig(response_mime_type="application/json")
+                model='gemini-3.5-flash', contents=f"Analyze these recent news headlines for '{ticker}':\n{headlines}\nReturn ONLY a valid JSON: {{\"sentiment_score\": <float -1.0 to 1.0>, \"executive_summary\": \"<1 sentence summary without any double quotes inside>\"}}", config=types.GenerateContentConfig(response_mime_type="application/json")
             )
             raw_text = resp.text.strip()
             match = re.search(r'\{.*\}', raw_text, re.DOTALL)
             clean_json = match.group(0) if match else raw_text
-            
             try: ai_json = json.loads(clean_json)
-            except Exception: ai_json = {"sentiment_score": 0.0, "executive_summary": clean_json.replace('"', "'").replace('\n', ' ')}
-                
+            except: ai_json = {"sentiment_score": 0.0, "executive_summary": clean_json.replace('"', "'").replace('\n', ' ')}
             ai_score = safe_float(ai_json.get('sentiment_score', 0.0))
             ai_summary = ai_json.get('executive_summary', "No summary provided.")
+        else: ai_score, ai_summary = 0.0, "No headlines found."
     except Exception as e:
-        ai_summary = f"News parser diagnostic: {str(e)}"
+        ai_score, ai_summary = 0.0, f"News parser diagnostic: {str(e)}"
 
-    # Candlestick Payload
     recent_candles_df = raw_data.tail(100)
-    candle_list = []
-    for _, row in recent_candles_df.iterrows():
-        candle_list.append({
-            "time": str(row['Date'].date()),
-            "open": safe_float(round(row['Open'], 2)),
-            "high": safe_float(round(row['High'], 2)),
-            "low": safe_float(round(row['Low'], 2)),
-            "close": safe_float(round(row['ClosePrice'], 2)),
-            "volume": safe_float(row['Volume'])
-        })
+    candle_list = [{"time": str(row['Date'].date()), "open": safe_float(row['Open']), "high": safe_float(row['High']), "low": safe_float(row['Low']), "close": safe_float(row['ClosePrice']), "volume": safe_float(row['Volume'])} for _, row in recent_candles_df.iterrows()]
 
     fundamentals = calculate_institutional_fundamentals(ticker)
 
@@ -579,7 +510,8 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
             "unfiltered": [float(round(x, 4)) for x in (np.exp(clean_df['Ret_Unfilt'].cumsum().fillna(0)) - 1).tolist()],
             "filtered": [float(round(x, 4)) for x in (np.exp(clean_df['Ret_Filt'].cumsum().fillna(0)) - 1).tolist()]
         },
-        "candles": candle_list
+        "candles": candle_list,
+        "forecast_data": forecast_payload
     }
     
     return sanitize_json(response_payload)
