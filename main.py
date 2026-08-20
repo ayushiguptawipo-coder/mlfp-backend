@@ -37,7 +37,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global Crash Handler with CORS preservation
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     return JSONResponse(
@@ -46,6 +45,7 @@ async def global_exception_handler(request: Request, exc: Exception):
         headers={"Access-Control-Allow-Origin": "*"}
     )
 
+# Watchlist Defaults (for the Heatmap)
 UPSTOX_KEYS = {
     'SBIN': 'NSE_EQ|INE062A01020',
     'RELIANCE': 'NSE_EQ|INE002A01018',
@@ -55,11 +55,12 @@ UPSTOX_KEYS = {
     'ICICIBANK': 'NSE_EQ|INE090A01021'
 }
 
-def fetch_upstox_data(symbol, years=3):
-    instrument_key = UPSTOX_KEYS.get(symbol)
+# UNIVERSAL DATA FETCHER
+def fetch_upstox_data_dynamic(instrument_key, years=3):
     to_date = datetime.now().strftime('%Y-%m-%d')
     from_date = (datetime.now() - timedelta(days=365 * years)).strftime('%Y-%m-%d')
-    url = f'https://api.upstox.com/v2/historical-candle/{instrument_key}/day/{to_date}/{from_date}'
+    safe_key = urllib.parse.quote(instrument_key)
+    url = f'https://api.upstox.com/v2/historical-candle/{safe_key}/day/{to_date}/{from_date}'
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {UPSTOX_ACCESS_TOKEN}'}
     
     try:
@@ -79,7 +80,6 @@ def generate_hybrid_features(df):
     df['Log_Returns'] = np.log(df['ClosePrice'] / df['ClosePrice'].shift(1)).replace([np.inf, -np.inf], np.nan).fillna(0)
     df['Forward_Return'] = np.log(df['ClosePrice'].shift(-1) / df['ClosePrice'])
     
-    # 1. Macro Trend Features (Anti-Counter-Trend Protection)
     sma_200 = df['ClosePrice'].rolling(window=200, min_periods=50).mean()
     df['Macro_Bull_Trend'] = (df['ClosePrice'] > sma_200).astype(int)
     
@@ -87,7 +87,6 @@ def generate_hybrid_features(df):
     df['SMA_20_Dist'] = (df['ClosePrice'] - sma_20) / sma_20
     df['Relative_Volume'] = df['Volume'] / df['Volume'].rolling(window=20).mean()
     
-    # 2. Momentum Indicators
     delta = df['ClosePrice'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
@@ -99,7 +98,6 @@ def generate_hybrid_features(df):
     df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
     df['MACD_Hist'] = df['MACD'] - df['MACD_Signal']
     
-    # 3. Volatility & True Range
     high_low = df['High'] - df['Low']
     high_close = (df['High'] - df['ClosePrice'].shift()).abs()
     low_close = (df['Low'] - df['ClosePrice'].shift()).abs()
@@ -130,11 +128,43 @@ def generate_hybrid_features(df):
 def home():
     return {"status": "MLFP Quant Engine Pro API is online."}
 
+# NEW: UNIVERSAL SEARCH ENDPOINT
+@app.get("/api/search")
+def search_stock(q: str):
+    if not q or len(q) < 2: return {"results": []}
+    
+    url = f'https://api.upstox.com/v2/instruments/search?query={urllib.parse.quote(q)}&segments=EQ'
+    headers = {'Accept': 'application/json', 'Authorization': f'Bearer {UPSTOX_ACCESS_TOKEN}'}
+    
+    try:
+        res = requests.get(url, headers=headers, timeout=4)
+        if res.status_code == 200:
+            data = res.json().get('data', [])
+            results = []
+            for item in data:
+                if item.get('segment') in ['NSE_EQ', 'BSE_EQ']:
+                    results.append({
+                        "ticker": item.get('trading_symbol'),
+                        "name": item.get('name'),
+                        "instrument_key": item.get('instrument_key')
+                    })
+            
+            # Deduplicate by ticker (Prefer NSE)
+            unique_results = {}
+            for r in results:
+                if r['ticker'] not in unique_results:
+                    unique_results[r['ticker']] = r
+            
+            return {"results": list(unique_results.values())[:8]}
+    except Exception:
+        pass
+    return {"results": []}
+
 @app.get("/api/scanner")
 def get_market_scanner():
     results = []
-    for ticker in UPSTOX_KEYS.keys():
-        df = fetch_upstox_data(ticker, years=1)
+    for ticker, instr_key in UPSTOX_KEYS.items():
+        df = fetch_upstox_data_dynamic(instr_key, years=1)
         if df.empty or len(df) < 30: continue
         
         df['Rolling_Vol'] = np.log(df['ClosePrice'] / df['ClosePrice'].shift(1)).replace([np.inf, -np.inf], np.nan).fillna(0).rolling(10).std()
@@ -161,14 +191,19 @@ def get_market_scanner():
     return {"scanner": results}
 
 @app.get("/api/analyze/{ticker}")
-def analyze_stock(ticker: str, friction: float = Query(0.0015), neutral_band: float = Query(0.05)):
+def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: float = Query(0.0015), neutral_band: float = Query(0.05)):
     ticker = ticker.upper()
-    if ticker not in UPSTOX_KEYS:
-        raise HTTPException(status_code=400, detail="Ticker not supported.")
     
-    raw_data = fetch_upstox_data(ticker)
+    # DYNAMIC KEY RESOLUTION
+    if not instrument_key:
+        instrument_key = UPSTOX_KEYS.get(ticker)
+        
+    if not instrument_key:
+        raise HTTPException(status_code=400, detail="Instrument Key missing. Please select the stock from the search dropdown.")
+        
+    raw_data = fetch_upstox_data_dynamic(instrument_key, years=3)
     if raw_data.empty: 
-        raise HTTPException(status_code=400, detail=f"Upstox data feed timed out for {ticker}.")
+        raise HTTPException(status_code=400, detail=f"Upstox data feed timed out or returned empty for {ticker}.")
         
     master_df = generate_hybrid_features(raw_data)
 
@@ -187,7 +222,6 @@ def analyze_stock(ticker: str, friction: float = Query(0.0015), neutral_band: fl
     ]
     X, y = master_df[feature_cols], master_df['Target_Direction']
     
-    # 5-Model Institutional Bake-Off (Strict Regularization against Overfitting)
     models = {
         "CatBoost": CatBoostClassifier(depth=3, iterations=60, learning_rate=0.03, l2_leaf_reg=3.0, verbose=0, random_seed=42),
         "LightGBM": LGBMClassifier(max_depth=3, n_estimators=50, learning_rate=0.03, subsample=0.8, reg_alpha=1.0, reg_lambda=1.0, verbose=-1, random_state=42),
@@ -213,9 +247,7 @@ def analyze_stock(ticker: str, friction: float = Query(0.0015), neutral_band: fl
 
     best_model_name = max(results, key=lambda k: np.mean(results[k]['auc']))
     
-    # Out-of-Sample Simulation with Sizing & Trend Guardrail
     oos_positions, oos_indices = [], []
-    current_pos = 0.0
     
     for train_idx, test_idx in tscv.split(X):
         scaler = StandardScaler()
@@ -227,23 +259,20 @@ def analyze_stock(ticker: str, friction: float = Query(0.0015), neutral_band: fl
         macro_trends = master_df['Macro_Bull_Trend'].iloc[test_idx].values
         
         for p, is_bull_trend in zip(probs, macro_trends):
-            # Dynamic Conviction Sizing
             if p > (0.50 + neutral_band):
                 conviction = (p - 0.50) / 0.50
                 target_alloc = 0.30 if conviction < 0.25 else (0.65 if conviction < 0.50 else 1.00)
-                current_pos = target_alloc
+                oos_positions.append(target_alloc)
             elif p < (0.50 - neutral_band):
-                # Guardrail: Never short during a Macro Bull Trend
                 if is_bull_trend == 1:
-                    current_pos = 0.0
+                    oos_positions.append(0.0)
                 else:
                     conviction = (0.50 - p) / 0.50
                     target_alloc = 0.30 if conviction < 0.25 else (0.65 if conviction < 0.50 else 1.00)
-                    current_pos = -target_alloc
+                    oos_positions.append(-target_alloc)
             else:
-                current_pos = 0.0
+                oos_positions.append(0.0)
                 
-            oos_positions.append(current_pos)
         oos_indices.extend(test_idx)
 
     res_df = master_df.iloc[oos_indices].copy()
@@ -252,7 +281,6 @@ def analyze_stock(ticker: str, friction: float = Query(0.0015), neutral_band: fl
     res_df['Friction_Unfilt'] = (res_df['Position_Unfilt'].diff().abs().fillna(0)) * friction
     res_df['Ret_Unfilt'] = (res_df['Position_Unfilt'] * res_df['Forward_Return']) - res_df['Friction_Unfilt']
     
-    # Low-volatility regime gating
     res_df['Position_Filt'] = np.where(res_df['Regime_Label'] == 'Low Volatility', res_df['Position_Unfilt'], 0.0)
     res_df['Friction_Filt'] = (res_df['Position_Filt'].diff().abs().fillna(0)) * friction
     res_df['Ret_Filt'] = (res_df['Position_Filt'] * res_df['Forward_Return']) - res_df['Friction_Filt']
@@ -275,7 +303,6 @@ def analyze_stock(ticker: str, friction: float = Query(0.0015), neutral_band: fl
     else:
         quant_signal = "NEUTRAL"
 
-    # Gemini Sentiment Engine with Quote Protection
     ai_score, ai_summary = 0.0, "AI Sentiment Feed Unavailable"
     try:
         q = urllib.parse.quote(f"{ticker} stock news India")
@@ -299,10 +326,8 @@ def analyze_stock(ticker: str, friction: float = Query(0.0015), neutral_band: fl
             match = re.search(r'\{.*\}', raw_text, re.DOTALL)
             clean_json = match.group(0) if match else raw_text
             
-            try:
-                ai_json = json.loads(clean_json)
-            except Exception:
-                ai_json = {"sentiment_score": 0.0, "executive_summary": clean_json.replace('"', "'").replace('\n', ' ')}
+            try: ai_json = json.loads(clean_json)
+            except Exception: ai_json = {"sentiment_score": 0.0, "executive_summary": clean_json.replace('"', "'").replace('\n', ' ')}
                 
             ai_score = ai_json.get('sentiment_score', 0.0)
             ai_summary = ai_json.get('executive_summary', "No summary provided.")
