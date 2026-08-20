@@ -6,6 +6,7 @@ import re
 import json
 import urllib.parse
 import feedparser
+import yfinance as yf
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -68,9 +69,7 @@ def fetch_live_quote(instrument_keys_list):
     return {}
 
 def extract_quote_data(quotes_dict, ticker, instr_key):
-    """Safely extracts live quote data matching by ticker, ISIN, or formatted key."""
-    if not quotes_dict:
-        return {}
+    if not quotes_dict: return {}
     isin = instr_key.split('|')[-1] if '|' in instr_key else instr_key
     for k, v in quotes_dict.items():
         if ticker in k or isin in k or instr_key in k or instr_key.replace('|', ':') in k:
@@ -83,7 +82,6 @@ def fetch_upstox_data_dynamic(instrument_key, years=3):
     safe_key = urllib.parse.quote(instrument_key)
     url = f'https://api.upstox.com/v2/historical-candle/{safe_key}/day/{to_date}/{from_date}'
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {UPSTOX_ACCESS_TOKEN}'}
-    
     try:
         response = requests.get(url, headers=headers, timeout=6)
         if response.status_code == 200:
@@ -95,6 +93,131 @@ def fetch_upstox_data_dynamic(instrument_key, years=3):
     except Exception:
         pass
     return pd.DataFrame()
+
+# --- INSTITUTIONAL FUNDAMENTAL ANALYSIS ENGINE ---
+def calculate_institutional_fundamentals(ticker: str):
+    """Calculates Altman Z-Score, DuPont 3-Stage Breakdown, and Economic Value Added (EVA)."""
+    default_response = {
+        "altman_z": {"score": 0.0, "zone": "Data Unavailable", "status": "grey", "desc": "Balance sheet metrics could not be retrieved."},
+        "dupont": {"roe": 0.0, "profit_margin": 0.0, "asset_turnover": 0.0, "financial_leverage": 0.0, "verdict": "Unavailable"},
+        "eva": {"eva_cr": 0.0, "nopat_cr": 0.0, "wacc_pct": 0.0, "invested_capital_cr": 0.0, "status": "Neutral", "verdict": "Unavailable"}
+    }
+    
+    try:
+        clean_sym = ticker.upper().replace(".NS", "").replace(".BO", "")
+        # Primary lookup via NSE suffix, fallback to BSE
+        stock = yf.Ticker(f"{clean_sym}.NS")
+        info = stock.info
+        bs = stock.balance_sheet
+        fin = stock.financials
+        
+        if bs.empty or fin.empty:
+            stock = yf.Ticker(f"{clean_sym}.BO")
+            info = stock.info
+            bs = stock.balance_sheet
+            fin = stock.financials
+            
+        if bs.empty or fin.empty:
+            return default_response
+
+        # Latest fiscal year columns
+        latest_bs = bs.iloc[:, 0]
+        latest_fin = fin.iloc[:, 0]
+
+        # Financial statement variables
+        total_assets = float(latest_bs.get('Total Assets', 1.0))
+        current_assets = float(latest_bs.get('Current Assets', total_assets * 0.4))
+        current_liabilities = float(latest_bs.get('Current Liabilities', total_assets * 0.2))
+        working_capital = current_assets - current_liabilities
+        retained_earnings = float(latest_bs.get('Retained Earnings', total_assets * 0.15))
+        total_equity = float(latest_bs.get('Stockholders Equity', total_assets * 0.4))
+        total_debt = float(latest_bs.get('Total Debt', total_assets * 0.2))
+        total_liabilities = total_assets - total_equity
+        
+        revenue = float(latest_fin.get('Total Revenue', 1.0))
+        ebit = float(latest_fin.get('EBIT', latest_fin.get('Operating Income', revenue * 0.15)))
+        net_income = float(latest_fin.get('Net Income', revenue * 0.10))
+        market_cap = float(info.get('marketCap', total_equity * 2.0))
+
+        # 1. ALTMAN Z-SCORE
+        x1 = working_capital / total_assets
+        x2 = retained_earnings / total_assets
+        x3 = ebit / total_assets
+        x4 = market_cap / (total_liabilities if total_liabilities > 0 else 1.0)
+        x5 = revenue / total_assets
+        z_score = float(round((1.2 * x1) + (1.4 * x2) + (3.3 * x3) + (0.6 * x4) + (0.999 * x5), 2))
+        
+        if z_score > 2.99:
+            z_zone, z_status, z_desc = "Safe Zone", "green", "Pristine balance sheet with negligible bankruptcy risk."
+        elif z_score >= 1.81:
+            z_zone, z_status, z_desc = "Grey Zone", "yellow", "Moderate solvency buffer. Debt management should be monitored."
+        else:
+            z_zone, z_status, z_desc = "Distress Zone", "red", "High financial stress. Balance sheet carries significant default risk."
+
+        # 2. DUPONT ANALYSIS (3-Stage)
+        net_margin = (net_income / revenue) if revenue > 0 else 0.0
+        asset_turnover = (revenue / total_assets) if total_assets > 0 else 0.0
+        fin_leverage = (total_assets / total_equity) if total_equity > 0 else 1.0
+        roe = net_margin * asset_turnover * fin_leverage
+
+        if fin_leverage > 4.0:
+            dupont_verdict = "High Leverage Engine (ROE driven heavily by debt leverage)"
+        elif net_margin > 0.15:
+            dupont_verdict = "Pricing Power Engine (ROE driven by strong profit margins)"
+        else:
+            dupont_verdict = "Asset Velocity Engine (ROE driven by asset turnover & volume)"
+
+        # 3. ECONOMIC VALUE ADDED (EVA)
+        tax_rate = 0.25
+        nopat = ebit * (1 - tax_rate)
+        invested_capital = total_equity + total_debt
+        
+        beta = float(info.get('beta', 1.0))
+        risk_free_rate = 0.070  # Indian 10-Yr G-Sec Benchmark ~7.0%
+        equity_risk_premium = 0.055  # Indian Market Risk Premium ~5.5%
+        cost_of_equity = risk_free_rate + (beta * equity_risk_premium)
+        cost_of_debt = 0.085 * (1 - tax_rate)
+        
+        total_cap = total_equity + total_debt
+        w_equity = total_equity / total_cap if total_cap > 0 else 1.0
+        w_debt = total_debt / total_cap if total_cap > 0 else 0.0
+        wacc = (w_equity * cost_of_equity) + (w_debt * cost_of_debt)
+        
+        eva = nopat - (wacc * invested_capital)
+        eva_cr = float(round(eva / 1e7, 2))  # Express in Crore
+        nopat_cr = float(round(nopat / 1e7, 2))
+        inv_cap_cr = float(round(invested_capital / 1e7, 2))
+
+        if eva_cr > 0:
+            eva_status, eva_verdict = "Value Creator", f"Generates ₹{eva_cr} Cr in true economic profit above its {round(wacc * 100, 1)}% cost of capital."
+        else:
+            eva_status, eva_verdict = "Value Destroyer", f"Consumes ₹{abs(eva_cr)} Cr in capital, earning below its {round(wacc * 100, 1)}% hurdle rate."
+
+        return {
+            "altman_z": {
+                "score": z_score,
+                "zone": z_zone,
+                "status": z_status,
+                "desc": z_desc
+            },
+            "dupont": {
+                "roe": float(round(roe * 100, 2)),
+                "profit_margin": float(round(net_margin * 100, 2)),
+                "asset_turnover": float(round(asset_turnover, 2)),
+                "financial_leverage": float(round(fin_leverage, 2)),
+                "verdict": dupont_verdict
+            },
+            "eva": {
+                "eva_cr": eva_cr,
+                "nopat_cr": nopat_cr,
+                "wacc_pct": float(round(wacc * 100, 2)),
+                "invested_capital_cr": inv_cap_cr,
+                "status": eva_status,
+                "verdict": eva_verdict
+            }
+        }
+    except Exception as e:
+        return default_response
 
 def generate_hybrid_features(df):
     df = df.copy()
@@ -144,7 +267,6 @@ def generate_hybrid_features(df):
     df['Target_Direction'] = (df['Forward_Return'] > 0).astype(int)
     df['Rolling_Vol'] = df['Log_Returns'].rolling(window=10).std()
     
-    # Drop rows missing historical lag features, but retain the final live row for tomorrow's prediction
     clean_df = df.dropna(subset=['Log_Returns_Lag2', 'RSI_14', 'MACD', 'ATR_14', 'AR1_Forecast']).reset_index(drop=True)
     return clean_df
 
@@ -191,10 +313,9 @@ def get_market_scanner():
         df['Rolling_Vol'] = np.log(df['ClosePrice'] / df['ClosePrice'].shift(1)).replace([np.inf, -np.inf], np.nan).fillna(0).rolling(10).std()
         sma20 = df['ClosePrice'].rolling(20).mean().iloc[-1]
         
-        # Robust quote extraction across symbol and ISIN keys
         q_data = extract_quote_data(quotes, ticker, instr_key)
         live_price = float(q_data.get('last_price', df['ClosePrice'].iloc[-1]))
-        change_pct = float(q_data.get('net_change', 0.0))
+        change_val = float(q_data.get('net_change', 0.0))
         
         avg_vol = df['Rolling_Vol'].mean()
         curr_vol = df['Rolling_Vol'].iloc[-1]
@@ -211,7 +332,7 @@ def get_market_scanner():
             "regime": str(regime),
             "signal": str(signal),
             "price": float(round(live_price, 2)),
-            "change_pct": float(round(change_pct, 2)),
+            "change_val": float(round(change_val, 2)),
             "status": str(status)
         })
     return {"scanner": results}
@@ -239,7 +360,7 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
     current_day_open = float(quote_info.get('ohlc', {}).get('open', current_live_price))
     current_day_volume = float(quote_info.get('volume', raw_data['Volume'].iloc[-1]))
 
-    # --- INFERENCE FIX: Stitch today's live candle into raw_data BEFORE feature engineering ---
+    # Stitch live row before features
     today_dt = pd.to_datetime(datetime.now().date())
     if raw_data['Date'].iloc[-1].date() < today_dt.date():
         today_row = pd.DataFrame([{
@@ -268,7 +389,6 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
         'MACD', 'MACD_Hist', 'ATR_14'
     ]
     
-    # Train backtest models only on completed historical rows (excluding today's incomplete forward return)
     hist_train_df = master_df.iloc[:-1].copy()
     X_hist, y_hist = hist_train_df[feature_cols], hist_train_df['Target_Direction']
     
@@ -334,12 +454,10 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
 
     clean_df = res_df.dropna(subset=['Ret_Unfilt', 'Ret_Filt', 'Forward_Return'])
     
-    # Fit full model up to yesterday, then predict on TODAY'S live feature row for TOMORROW
     final_scaler = StandardScaler()
     X_scaled = final_scaler.fit_transform(X_hist)
     live_model = models[best_model_name].fit(X_scaled, y_hist)
     
-    # Live row containing today's stitched price indicators
     live_features_today = final_scaler.transform(master_df[feature_cols].iloc[[-1]])
     prob_up = live_model.predict_proba(live_features_today)[0][1]
 
@@ -354,7 +472,7 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
     else:
         quant_signal = "NEUTRAL"
 
-    # Gemini News Catalyst Analysis
+    # Gemini News Catalyst
     ai_score, ai_summary = 0.0, "AI Sentiment Feed Unavailable"
     try:
         q = urllib.parse.quote(f"{ticker} stock news India")
@@ -385,7 +503,7 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
     except Exception as e:
         ai_summary = f"News parser diagnostic: {str(e)}"
 
-    # Candlestick Payload (Includes today's live stitched candle)
+    # Candlestick Payload
     recent_candles_df = raw_data.tail(100)
     candle_list = []
     for _, row in recent_candles_df.iterrows():
@@ -398,10 +516,13 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
             "volume": float(row['Volume'])
         })
 
+    # Compute Long-Term Fundamentals
+    fundamentals = calculate_institutional_fundamentals(ticker)
+
     return {
         "ticker": str(ticker),
         "live_price": float(round(current_live_price, 2)),
-        "day_change_pct": float(round(current_day_change, 2)),
+        "day_change_val": float(round(current_day_change, 2)),
         "day_high": float(round(current_day_high, 2)),
         "day_low": float(round(current_day_low, 2)),
         "current_regime": str(master_df['Regime_Label'].iloc[-1]),
@@ -410,6 +531,7 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
         "quant_probability": float(round(float(prob_up) * 100, 2)),
         "ai_sentiment_score": float(ai_score),
         "ai_summary": str(ai_summary),
+        "fundamentals": fundamentals,
         "diagnostics": {
             "unfiltered_trades": int(clean_df['Position_Unfilt'].diff().abs().gt(0).sum()),
             "filtered_trades": int(clean_df['Position_Filt'].diff().abs().gt(0).sum()),
