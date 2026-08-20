@@ -56,7 +56,6 @@ UPSTOX_KEYS = {
 
 def fetch_live_quote(instrument_keys_list):
     if not instrument_keys_list: return {}
-    # FIX: Encode individual keys but leave the comma intact so Upstox doesn't reject the request
     keys_param = ",".join([urllib.parse.quote(k) for k in instrument_keys_list])
     url = f'https://api.upstox.com/v2/market-quote/quotes?instrument_key={keys_param}'
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {UPSTOX_ACCESS_TOKEN}'}
@@ -66,6 +65,16 @@ def fetch_live_quote(instrument_keys_list):
             return res.json().get('data', {})
     except Exception:
         pass
+    return {}
+
+def extract_quote_data(quotes_dict, ticker, instr_key):
+    """Safely extracts live quote data matching by ticker, ISIN, or formatted key."""
+    if not quotes_dict:
+        return {}
+    isin = instr_key.split('|')[-1] if '|' in instr_key else instr_key
+    for k, v in quotes_dict.items():
+        if ticker in k or isin in k or instr_key in k or instr_key.replace('|', ':') in k:
+            return v
     return {}
 
 def fetch_upstox_data_dynamic(instrument_key, years=3):
@@ -134,7 +143,10 @@ def generate_hybrid_features(df):
     df['AR1_Forecast'] = ar_preds
     df['Target_Direction'] = (df['Forward_Return'] > 0).astype(int)
     df['Rolling_Vol'] = df['Log_Returns'].rolling(window=10).std()
-    return df.dropna().reset_index(drop=True)
+    
+    # Drop rows missing historical lag features, but retain the final live row for tomorrow's prediction
+    clean_df = df.dropna(subset=['Log_Returns_Lag2', 'RSI_14', 'MACD', 'ATR_14', 'AR1_Forecast']).reset_index(drop=True)
+    return clean_df
 
 @app.api_route("/", methods=["GET", "HEAD"])
 def home():
@@ -179,16 +191,10 @@ def get_market_scanner():
         df['Rolling_Vol'] = np.log(df['ClosePrice'] / df['ClosePrice'].shift(1)).replace([np.inf, -np.inf], np.nan).fillna(0).rolling(10).std()
         sma20 = df['ClosePrice'].rolling(20).mean().iloc[-1]
         
-        # FIX: Bullet-proof dictionary extraction. If the ISIN code matches anywhere, grab it!
-        q_data = {}
-        if quotes:
-            for k, v in quotes.items():
-                if instr_key.split('|')[-1] in k:
-                    q_data = v
-                    break
-                    
-        live_price = q_data.get('last_price', df['ClosePrice'].iloc[-1])
-        change_pct = q_data.get('net_change', 0.0)
+        # Robust quote extraction across symbol and ISIN keys
+        q_data = extract_quote_data(quotes, ticker, instr_key)
+        live_price = float(q_data.get('last_price', df['ClosePrice'].iloc[-1]))
+        change_pct = float(q_data.get('net_change', 0.0))
         
         avg_vol = df['Rolling_Vol'].mean()
         curr_vol = df['Rolling_Vol'].iloc[-1]
@@ -223,16 +229,28 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
     if raw_data.empty: 
         raise HTTPException(status_code=400, detail=f"Data feed timed out or returned empty for {ticker}.")
         
-    # FIX: Guarantee we get the data by just pulling the first value, bypassing any Upstox key formatting mismatch
     live_quotes = fetch_live_quote([instrument_key])
-    quote_info = {}
-    if live_quotes:
-        quote_info = list(live_quotes.values())[0]
-        
+    quote_info = extract_quote_data(live_quotes, ticker, instrument_key)
+    
     current_live_price = float(quote_info.get('last_price', raw_data['ClosePrice'].iloc[-1]))
     current_day_change = float(quote_info.get('net_change', 0.0))
     current_day_high = float(quote_info.get('ohlc', {}).get('high', raw_data['High'].iloc[-1]))
     current_day_low = float(quote_info.get('ohlc', {}).get('low', raw_data['Low'].iloc[-1]))
+    current_day_open = float(quote_info.get('ohlc', {}).get('open', current_live_price))
+    current_day_volume = float(quote_info.get('volume', raw_data['Volume'].iloc[-1]))
+
+    # --- INFERENCE FIX: Stitch today's live candle into raw_data BEFORE feature engineering ---
+    today_dt = pd.to_datetime(datetime.now().date())
+    if raw_data['Date'].iloc[-1].date() < today_dt.date():
+        today_row = pd.DataFrame([{
+            'Date': today_dt,
+            'Open': current_day_open,
+            'High': max(current_day_high, current_live_price),
+            'Low': min(current_day_low, current_live_price),
+            'ClosePrice': current_live_price,
+            'Volume': current_day_volume
+        }])
+        raw_data = pd.concat([raw_data, today_row], ignore_index=True)
 
     master_df = generate_hybrid_features(raw_data)
 
@@ -249,7 +267,10 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
         'Log_Returns_Lag1', 'Log_Returns_Lag2', 'AR1_Forecast', 
         'MACD', 'MACD_Hist', 'ATR_14'
     ]
-    X, y = master_df[feature_cols], master_df['Target_Direction']
+    
+    # Train backtest models only on completed historical rows (excluding today's incomplete forward return)
+    hist_train_df = master_df.iloc[:-1].copy()
+    X_hist, y_hist = hist_train_df[feature_cols], hist_train_df['Target_Direction']
     
     models = {
         "CatBoost": CatBoostClassifier(depth=3, iterations=60, learning_rate=0.03, l2_leaf_reg=3.0, verbose=0, random_seed=42),
@@ -262,9 +283,9 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
     results = {name: {'auc': []} for name in models.keys()}
     tscv = TimeSeriesSplit(n_splits=5)
     
-    for train_idx, test_idx in tscv.split(X):
-        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
-        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+    for train_idx, test_idx in tscv.split(X_hist):
+        X_train, X_test = X_hist.iloc[train_idx], X_hist.iloc[test_idx]
+        y_train, y_test = y_hist.iloc[train_idx], y_hist.iloc[test_idx]
         scaler = StandardScaler()
         X_train_scaled = scaler.fit_transform(X_train)
         X_test_scaled = scaler.transform(X_test)
@@ -277,14 +298,14 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
     best_model_name = max(results, key=lambda k: np.mean(results[k]['auc']))
     
     oos_positions, oos_indices = [], []
-    for train_idx, test_idx in tscv.split(X):
+    for train_idx, test_idx in tscv.split(X_hist):
         scaler = StandardScaler()
-        X_train_scaled = scaler.fit_transform(X.iloc[train_idx])
-        X_test_scaled = scaler.transform(X.iloc[test_idx])
-        model = models[best_model_name].fit(X_train_scaled, y.iloc[train_idx])
+        X_train_scaled = scaler.fit_transform(X_hist.iloc[train_idx])
+        X_test_scaled = scaler.transform(X_hist.iloc[test_idx])
+        model = models[best_model_name].fit(X_train_scaled, y_hist.iloc[train_idx])
         
         probs = model.predict_proba(X_test_scaled)[:, 1]
-        macro_trends = master_df['Macro_Bull_Trend'].iloc[test_idx].values
+        macro_trends = hist_train_df['Macro_Bull_Trend'].iloc[test_idx].values
         
         for p, is_bull_trend in zip(probs, macro_trends):
             if p > (0.50 + neutral_band):
@@ -302,7 +323,7 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
                 oos_positions.append(0.0)
         oos_indices.extend(test_idx)
 
-    res_df = master_df.iloc[oos_indices].copy()
+    res_df = hist_train_df.iloc[oos_indices].copy()
     res_df['Position_Unfilt'] = oos_positions
     res_df['Friction_Unfilt'] = (res_df['Position_Unfilt'].diff().abs().fillna(0)) * friction
     res_df['Ret_Unfilt'] = (res_df['Position_Unfilt'] * res_df['Forward_Return']) - res_df['Friction_Unfilt']
@@ -313,10 +334,14 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
 
     clean_df = res_df.dropna(subset=['Ret_Unfilt', 'Ret_Filt', 'Forward_Return'])
     
+    # Fit full model up to yesterday, then predict on TODAY'S live feature row for TOMORROW
     final_scaler = StandardScaler()
-    X_scaled = final_scaler.fit_transform(X)
-    live_model = models[best_model_name].fit(X_scaled, y)
-    prob_up = live_model.predict_proba(final_scaler.transform(master_df[feature_cols].iloc[[-1]]))[0][1]
+    X_scaled = final_scaler.fit_transform(X_hist)
+    live_model = models[best_model_name].fit(X_scaled, y_hist)
+    
+    # Live row containing today's stitched price indicators
+    live_features_today = final_scaler.transform(master_df[feature_cols].iloc[[-1]])
+    prob_up = live_model.predict_proba(live_features_today)[0][1]
 
     upper_bound = 0.5 + neutral_band
     lower_bound = 0.5 - neutral_band
@@ -329,7 +354,7 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
     else:
         quant_signal = "NEUTRAL"
 
-    # Gemini News Sentiment Engine
+    # Gemini News Catalyst Analysis
     ai_score, ai_summary = 0.0, "AI Sentiment Feed Unavailable"
     try:
         q = urllib.parse.quote(f"{ticker} stock news India")
@@ -360,7 +385,7 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
     except Exception as e:
         ai_summary = f"News parser diagnostic: {str(e)}"
 
-    # Candlestick Payload Construction
+    # Candlestick Payload (Includes today's live stitched candle)
     recent_candles_df = raw_data.tail(100)
     candle_list = []
     for _, row in recent_candles_df.iterrows():
@@ -371,19 +396,6 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
             "low": float(round(row['Low'], 2)),
             "close": float(round(row['ClosePrice'], 2)),
             "volume": float(row['Volume'])
-        })
-
-    # FIX 2: Correct Live Candle Stitching for Today
-    today_str = datetime.now().strftime('%Y-%m-%d')
-    if quote_info and candle_list[-1]["time"] != today_str:
-        ohlc = quote_info.get('ohlc', {})
-        candle_list.append({
-            "time": today_str,
-            "open": float(round(ohlc.get('open', current_live_price), 2)),
-            "high": float(round(ohlc.get('high', current_live_price), 2)),
-            "low": float(round(ohlc.get('low', current_live_price), 2)),
-            "close": float(round(current_live_price, 2)),
-            "volume": float(quote_info.get('volume', 0.0))
         })
 
     return {
