@@ -55,7 +55,6 @@ UPSTOX_KEYS = {
 }
 
 def fetch_live_quote(instrument_keys_list):
-    """Fetches real-time LTP and daily stats for multiple instrument keys."""
     if not instrument_keys_list: return {}
     keys_param = ",".join(instrument_keys_list)
     url = f'https://api.upstox.com/v2/market-quote/quotes?instrument_key={urllib.parse.quote(keys_param)}'
@@ -179,8 +178,8 @@ def get_market_scanner():
         df['Rolling_Vol'] = np.log(df['ClosePrice'] / df['ClosePrice'].shift(1)).replace([np.inf, -np.inf], np.nan).fillna(0).rolling(10).std()
         sma20 = df['ClosePrice'].rolling(20).mean().iloc[-1]
         
-        # Real-time quote integration
-        q_data = quotes.get(instr_key.replace('|', ':'), {})
+        # FIX: Check both '|' and ':' formats to ensure live quotes are found
+        q_data = quotes.get(instr_key, quotes.get(instr_key.replace('|', ':'), {}))
         live_price = q_data.get('last_price', df['ClosePrice'].iloc[-1])
         change_pct = q_data.get('net_change', 0.0)
         
@@ -217,9 +216,10 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
     if raw_data.empty: 
         raise HTTPException(status_code=400, detail=f"Data feed timed out or returned empty for {ticker}.")
         
-    # Real-Time Price Pull
+    # FIX 1: Robust Live Quote Fetching
     live_quotes = fetch_live_quote([instrument_key])
-    quote_info = live_quotes.get(instrument_key.replace('|', ':'), {})
+    quote_info = live_quotes.get(instrument_key, live_quotes.get(instrument_key.replace('|', ':'), {}))
+    
     current_live_price = float(quote_info.get('last_price', raw_data['ClosePrice'].iloc[-1]))
     current_day_change = float(quote_info.get('net_change', 0.0))
     current_day_high = float(quote_info.get('ohlc', {}).get('high', raw_data['High'].iloc[-1]))
@@ -351,7 +351,7 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
     except Exception as e:
         ai_summary = f"News parser diagnostic: {str(e)}"
 
-    # Candlestick Payload (Past 100 days for high-speed rendering)
+    # Candlestick Payload
     recent_candles_df = raw_data.tail(100)
     candle_list = []
     for _, row in recent_candles_df.iterrows():
@@ -363,6 +363,20 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
             "close": float(round(row['ClosePrice'], 2)),
             "volume": float(row['Volume'])
         })
+
+    # FIX 2: Dynamic Live Candle Stitching
+    today_str = datetime.now().strftime('%Y-%m-%d')
+    if quote_info and candle_list[-1]["time"] != today_str:
+        ohlc = quote_info.get('ohlc', {})
+        if ohlc:
+            candle_list.append({
+                "time": today_str,
+                "open": float(round(ohlc.get('open', current_live_price), 2)),
+                "high": float(round(ohlc.get('high', current_live_price), 2)),
+                "low": float(round(ohlc.get('low', current_live_price), 2)),
+                "close": float(round(current_live_price, 2)),
+                "volume": float(quote_info.get('volume', 0.0))
+            })
 
     return {
         "ticker": str(ticker),
