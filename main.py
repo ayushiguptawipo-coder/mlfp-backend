@@ -12,7 +12,6 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from xgboost import XGBClassifier
 from lightgbm import LGBMClassifier
-from catboost import CatBoostClassifier
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.cluster import KMeans
@@ -23,6 +22,13 @@ from sklearn.linear_model import Ridge
 from google import genai
 from google.genai import types
 from datetime import datetime, timedelta
+
+# Optional import for CatBoost
+try:
+    from catboost import CatBoostClassifier
+    HAS_CATBOOST = True
+except ImportError:
+    HAS_CATBOOST = False
 
 # SECURE ENVIRONMENT VARIABLES
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
@@ -119,7 +125,6 @@ def fetch_upstox_data_dynamic(instrument_key, years=3):
 
 # --- SECTOR-ADAPTIVE INSTITUTIONAL & FORENSIC ENGINE ---
 def detect_sector_profile(info_dict, ticker: str):
-    """Detects if an asset is BFSI, Technology/Service, or Manufacturing."""
     sector = str(info_dict.get('sector', '')).lower()
     industry = str(info_dict.get('industry', '')).lower()
     
@@ -154,24 +159,23 @@ def calculate_institutional_fundamentals(ticker: str):
 
     sector_type = detect_sector_profile(info, clean_sym)
 
-    # 1. BFSI SECTOR HANDLING (Banks, Insurance, NBFCs)
+    # 1. BFSI (Banks / Insurance)
     if sector_type == 'BFSI':
         market_cap = safe_float(info.get('marketCap'), 200000.0)
-        net_income = 0.0
-        total_equity = 1.0
-        total_assets = 1.0
+        net_income = 10000.0
+        total_equity = market_cap * 0.4
+        total_assets = total_equity * 10.0
         
         if fin is not None and not fin.empty:
             net_income = safe_float(fin.iloc[:, 0].get('Net Income', fin.iloc[:, 0].get('Net Income Common Stockholders')), 10000.0)
         if bs is not None and not bs.empty:
-            total_equity = safe_float(bs.iloc[:, 0].get('Stockholders Equity'), market_cap * 0.4)
-            total_assets = safe_float(bs.iloc[:, 0].get('Total Assets'), total_equity * 10.0)
+            total_equity = safe_float(bs.iloc[:, 0].get('Stockholders Equity'), total_equity)
+            total_assets = safe_float(bs.iloc[:, 0].get('Total Assets'), total_assets)
             
         roe = (net_income / total_equity) if total_equity > 0 else 0.18
         leverage = (total_assets / total_equity) if total_equity > 0 else 12.0
         
-        # Calculate EVA on regulatory equity capital
-        cost_of_equity = 0.115  # ~11.5% hurdle rate for Indian financial sector
+        cost_of_equity = 0.115
         eva = net_income - (cost_of_equity * total_equity)
         eva_cr = safe_float(round(eva / 1e7, 2), 1500.0)
         nopat_cr = safe_float(round(net_income / 1e7, 2), 5000.0)
@@ -182,7 +186,7 @@ def calculate_institutional_fundamentals(ticker: str):
                 "score": "Exempt",
                 "zone": "BFSI Exemption",
                 "status": "green",
-                "desc": "Altman Z is not applicable to banks or insurers because policy reserves and deposits act as operational float rather than default debt."
+                "desc": "Altman Z is exempt for banks & insurers as policy reserves/deposits represent operational float, not distressed debt."
             },
             "dupont": {
                 "roe": safe_float(round(roe * 100, 2), 16.5),
@@ -204,7 +208,7 @@ def calculate_institutional_fundamentals(ticker: str):
                     "score": 7,
                     "status": "Strong Health",
                     "badge": "green",
-                    "desc": "Regulatory capital adequacy and net interest/underwriting margins are structurally sound."
+                    "desc": "Capital adequacy and underwriting margins are structurally sound."
                 },
                 "beneish_m": {
                     "score": "N/A",
@@ -215,7 +219,7 @@ def calculate_institutional_fundamentals(ticker: str):
             }
         }
 
-    # 2. TECHNOLOGY & SERVICES (Asset-Light Non-Manufacturing)
+    # 2. Technology & Services
     elif sector_type == 'SERVICE_TECH':
         try:
             latest_bs = bs.iloc[:, 0]
@@ -231,7 +235,6 @@ def calculate_institutional_fundamentals(ticker: str):
             revenue = safe_float(latest_fin.get('Total Revenue'), total_assets * 1.2)
             net_income = safe_float(latest_fin.get('Net Income'), revenue * 0.18)
 
-            # Altman Z'' (Double Prime Non-Manufacturing Formula)
             x1 = working_cap / total_assets
             x2 = retained_earn / total_assets
             x3 = ebit / total_assets
@@ -280,7 +283,7 @@ def calculate_institutional_fundamentals(ticker: str):
         except Exception:
             pass
 
-    # 3. MANUFACTURING & CAPITAL-INTENSIVE (Original Standard Formula)
+    # 3. Manufacturing & Capital Goods
     try:
         latest_bs = bs.iloc[:, 0]
         latest_fin = fin.iloc[:, 0]
@@ -298,7 +301,6 @@ def calculate_institutional_fundamentals(ticker: str):
         net_income = safe_float(latest_fin.get('Net Income'), revenue * 0.10)
         market_cap = safe_float(info.get('marketCap'), total_equity * 2.0)
 
-        # Standard Altman Z
         x1 = working_capital / total_assets
         x2 = retained_earnings / total_assets
         x3 = ebit / total_assets
@@ -503,12 +505,13 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
     X_hist, y_hist = hist_train_df[feature_cols], hist_train_df['Target_Direction']
     
     models = {
-        "CatBoost": CatBoostClassifier(depth=3, iterations=60, learning_rate=0.03, l2_leaf_reg=3.0, verbose=0, random_seed=42),
         "LightGBM": LGBMClassifier(max_depth=3, n_estimators=50, learning_rate=0.03, subsample=0.8, reg_alpha=1.0, reg_lambda=1.0, verbose=-1, random_state=42),
         "XGBoost": XGBClassifier(max_depth=3, n_estimators=50, learning_rate=0.03, subsample=0.8, colsample_bytree=0.8, reg_alpha=1.0, reg_lambda=1.0, random_state=42, eval_metric='logloss'),
         "Random Forest": RandomForestClassifier(n_estimators=60, max_depth=4, min_samples_leaf=8, random_state=42),
         "Logistic Regression": LogisticRegression(C=0.1, max_iter=500, random_state=42)
     }
+    if HAS_CATBOOST:
+        models["CatBoost"] = CatBoostClassifier(depth=3, iterations=60, learning_rate=0.03, l2_leaf_reg=3.0, verbose=0, random_seed=42)
     
     results = {name: {'auc': []} for name in models.keys()}
     tscv = TimeSeriesSplit(n_splits=5)
