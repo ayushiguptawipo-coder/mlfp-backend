@@ -336,13 +336,13 @@ def calculate_institutional_fundamentals(ticker: str):
         }
     except Exception:
         return {
-            "sector_profile": "General Corporate",
-            "altman_z": {"score": 2.85, "zone": "Safe Zone", "status": "green", "desc": "Solvent balance sheet with low default risk."},
-            "dupont": {"roe": 16.4, "profit_margin": 14.2, "asset_turnover": 0.75, "financial_leverage": 1.54, "verdict": "Pricing Power Engine"},
-            "eva": {"eva_cr": 320.0, "nopat_cr": 890.0, "wacc_pct": 11.2, "invested_capital_cr": 5100.0, "status": "Value Creator", "verdict": "Generates positive economic value."},
+            "sector_profile": "Data Feed Timeout",
+            "altman_z": {"score": 0.0, "zone": "API Blocked", "status": "grey", "desc": "Financial APIs are currently rate-limiting this request."},
+            "dupont": {"roe": 0.0, "profit_margin": 0.0, "asset_turnover": 0.0, "financial_leverage": 0.0, "verdict": "Data Unavailable"},
+            "eva": {"eva_cr": 0.0, "nopat_cr": 0.0, "wacc_pct": 0.0, "invested_capital_cr": 0.0, "status": "Error", "verdict": "Could not fetch WACC / NOPAT."},
             "forensics": {
-                "piotroski_f": {"score": 8, "status": "Strong Health", "badge": "green", "desc": "Robust balance sheet score (8/9)."},
-                "beneish_m": {"score": -2.48, "verdict": "Unlikely Manipulator", "badge": "green", "desc": "Low probability of earnings inflation."}
+                "piotroski_f": {"score": 0, "status": "Unavailable", "badge": "grey", "desc": "Audit failed due to missing balance sheet."},
+                "beneish_m": {"score": 0.0, "verdict": "Unavailable", "badge": "grey", "desc": "Forensic test aborted."}
             }
         }
 
