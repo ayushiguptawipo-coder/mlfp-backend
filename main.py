@@ -133,9 +133,7 @@ def detect_sector_profile(info_dict, ticker: str):
         if kw in sector or kw in industry or any(k in ticker.lower() for k in ['tcs', 'infy', 'wipro', 'hcl', 'techm']): return 'SERVICE_TECH'
     return 'MANUFACTURING_CAPITAL'
 
-# --- TIER 2 JUGAAD RAW FETCH ---
 def jugaad_fundamental_fetch(ticker):
-    """Bypasses yfinance by scraping raw Yahoo Finance JSON modules."""
     try:
         url = f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{ticker}?modules=financialData,defaultKeyStatistics,summaryProfile,price"
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
@@ -154,7 +152,6 @@ def calculate_institutional_fundamentals(ticker: str):
     raw_jugaad_data = None
     data_source_flag = "Tier 1: YFinance API"
 
-    # TIER 1: yfinance
     try:
         session = requests.Session()
         session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
@@ -168,7 +165,6 @@ def calculate_institutional_fundamentals(ticker: str):
     except Exception:
         pass
 
-    # TIER 2: Jugaad Scraper
     if (bs is None or bs.empty) or (fin is None or fin.empty):
         raw_jugaad_data = jugaad_fundamental_fetch(f"{clean_sym}.NS")
         if not raw_jugaad_data:
@@ -176,7 +172,6 @@ def calculate_institutional_fundamentals(ticker: str):
         if raw_jugaad_data:
             data_source_flag = "Tier 2: Jugaad JSON Bypass"
 
-    # TIER 3: Gemini AI Fallback
     if ((bs is None or bs.empty) or (fin is None or fin.empty)) and not raw_jugaad_data:
         try:
             client = genai.Client(api_key=GEMINI_API_KEY)
@@ -213,8 +208,6 @@ def calculate_institutional_fundamentals(ticker: str):
             }
         except Exception:
             pass
-
-        # TIER 4: HARD FAIL
         return {
             "sector_profile": "Data Feed Timeout (Tier 4 Fail)",
             "altman_z": {"score": 0.0, "zone": "API Blocked", "status": "grey", "desc": "All data waterfalls unreachable."},
@@ -223,8 +216,8 @@ def calculate_institutional_fundamentals(ticker: str):
             "forensics": {"piotroski_f": {"score": 0, "status": "Unavailable", "badge": "grey", "desc": "Audit failed."}, "beneish_m": {"score": 0.0, "verdict": "Unavailable", "badge": "grey", "desc": "Forensic test aborted."}}
         }
 
-    # PROCESS TIER 1 or TIER 2 DATA
     sector_type = detect_sector_profile(info, clean_sym)
+
     if raw_jugaad_data:
         try:
             fin_data = raw_jugaad_data.get('financialData', {})
@@ -240,7 +233,6 @@ def calculate_institutional_fundamentals(ticker: str):
             roe = safe_float(fin_data.get('returnOnEquity', {}).get('raw', 0.15))
             net_margin = safe_float(fin_data.get('profitMargins', {}).get('raw', 0.10))
             
-            # Approximations for Jugaad
             total_equity = net_income / roe if roe > 0 else market_cap * 0.5
             total_assets = total_equity + total_debt + total_cash
             asset_turnover = revenue / total_assets if total_assets > 0 else 0.5
@@ -266,19 +258,33 @@ def calculate_institutional_fundamentals(ticker: str):
         except Exception:
             pass
 
-    # TIER 1 Processing (Full yfinance data available)
     try:
         latest_bs = bs.iloc[:, 0]
         latest_fin = fin.iloc[:, 0]
         
+        # --- UNIT NORMALIZATION FIX ---
+        raw_assets = safe_float(latest_bs.get('Total Assets'), 1.0)
+        raw_mcap = safe_float(info.get('marketCap'), 1.0)
+        scale_factor = 1.0
+        
+        # If Market Cap is vastly larger than Total Assets (e.g., > 500x), the DB served scaled values
+        if raw_assets > 10.0 and raw_mcap > 10.0:
+            ratio = raw_mcap / raw_assets
+            if ratio > 500000:
+                scale_factor = 1000000.0  # DB gave Millions, needs reconstruction
+            elif ratio > 500:
+                scale_factor = 1000.0     # DB gave Thousands, needs reconstruction
+        
         if sector_type == 'BFSI':
             market_cap = safe_float(info.get('marketCap'), 200000.0)
-            net_income = safe_float(latest_fin.get('Net Income', latest_fin.get('Net Income Common Stockholders')), 10000.0)
-            total_equity = safe_float(latest_bs.get('Stockholders Equity'), market_cap * 0.4)
-            total_assets = safe_float(latest_bs.get('Total Assets'), total_equity * 10.0)
+            net_income = safe_float(latest_fin.get('Net Income', latest_fin.get('Net Income Common Stockholders')), 10000.0) * scale_factor
+            total_equity = safe_float(latest_bs.get('Stockholders Equity'), market_cap * 0.4 / scale_factor) * scale_factor
+            total_assets = safe_float(latest_bs.get('Total Assets'), (total_equity * 10.0) / scale_factor) * scale_factor
+            
             roe = (net_income / total_equity) if total_equity > 0 else 0.18
             leverage = (total_assets / total_equity) if total_equity > 0 else 12.0
             eva = net_income - (0.115 * total_equity)
+            
             return {
                 "sector_profile": "BFSI (Financial / Insurance Institution)",
                 "altman_z": {"score": "Exempt", "zone": "BFSI Exemption", "status": "green", "desc": "Altman Z is exempt for banks & insurers."},
@@ -287,18 +293,20 @@ def calculate_institutional_fundamentals(ticker: str):
                 "forensics": {"piotroski_f": {"score": 7, "status": "Strong Health", "badge": "green", "desc": "Capital adequacy structurally sound."}, "beneish_m": {"score": "N/A", "verdict": "BFSI Exemption", "badge": "green", "desc": "Accrual metrics bypassed."}}
             }
 
-        total_assets = safe_float(latest_bs.get('Total Assets'), 10000.0)
-        current_assets = safe_float(latest_bs.get('Current Assets'), total_assets * 0.4)
-        current_liabilities = safe_float(latest_bs.get('Current Liabilities'), total_assets * 0.2)
+        total_assets = safe_float(latest_bs.get('Total Assets'), 10000.0) * scale_factor
+        current_assets = safe_float(latest_bs.get('Current Assets'), (total_assets * 0.4) / scale_factor) * scale_factor
+        current_liabilities = safe_float(latest_bs.get('Current Liabilities'), (total_assets * 0.2) / scale_factor) * scale_factor
         working_capital = current_assets - current_liabilities
-        retained_earnings = safe_float(latest_bs.get('Retained Earnings'), total_assets * 0.15)
-        total_equity = safe_float(latest_bs.get('Stockholders Equity'), total_assets * 0.4)
-        total_debt = safe_float(latest_bs.get('Total Debt', latest_bs.get('Long Term Debt')), 0.0)
+        retained_earnings = safe_float(latest_bs.get('Retained Earnings'), (total_assets * 0.15) / scale_factor) * scale_factor
+        total_equity = safe_float(latest_bs.get('Stockholders Equity'), (total_assets * 0.4) / scale_factor) * scale_factor
+        total_debt = safe_float(latest_bs.get('Total Debt', latest_bs.get('Long Term Debt')), 0.0) * scale_factor
+        
         total_liabilities = total_assets - total_equity
         if total_liabilities <= 0: total_liabilities = 1.0
-        revenue = safe_float(latest_fin.get('Total Revenue'), 1.0)
-        ebit = safe_float(latest_fin.get('EBIT', latest_fin.get('Operating Income')), revenue * 0.15)
-        net_income = safe_float(latest_fin.get('Net Income'), revenue * 0.10)
+        
+        revenue = safe_float(latest_fin.get('Total Revenue'), 1.0) * scale_factor
+        ebit = safe_float(latest_fin.get('EBIT', latest_fin.get('Operating Income')), (revenue * 0.15) / scale_factor) * scale_factor
+        net_income = safe_float(latest_fin.get('Net Income'), (revenue * 0.10) / scale_factor) * scale_factor
         market_cap = safe_float(info.get('marketCap'), total_equity * 2.0)
 
         net_margin = (net_income / revenue) if revenue > 0 else 0.0
@@ -313,7 +321,7 @@ def calculate_institutional_fundamentals(ticker: str):
             eva = nopat - (0.105 * total_equity)
             return {
                 "sector_profile": "Technology & Professional Services",
-                "altman_z": {"score": z_score, "zone": f"{z_zone} (Z'' Non-Mfg)", "status": z_status, "desc": "Evaluated using Altman Z'' model."},
+                "altman_z": {"score": z_score, "zone": f"{z_zone} (Z'' Non-Mfg)", "status": z_status, "desc": "Evaluated using normalized Altman Z'' model."},
                 "dupont": {"roe": safe_float(round(roe * 100, 2)), "profit_margin": safe_float(round(net_margin * 100, 2)), "asset_turnover": safe_float(round(asset_turnover, 2)), "financial_leverage": safe_float(round(fin_leverage, 2)), "verdict": "Pricing Power & Human Capital Engine"},
                 "eva": {"eva_cr": safe_float(round(eva / 1e7, 2)), "nopat_cr": safe_float(round(nopat / 1e7, 2)), "wacc_pct": 10.5, "invested_capital_cr": safe_float(round(total_equity / 1e7, 2)), "status": "Value Creator" if eva > 0 else "Value Destroyer", "verdict": f"Generates true economic profit."},
                 "forensics": {"piotroski_f": {"score": 8, "status": "Strong Health", "badge": "green", "desc": "Superior balance sheet liquidity."}, "beneish_m": {"score": -2.65, "verdict": "Unlikely Manipulator", "badge": "green", "desc": "Earnings confirm zero revenue inflation."}}
@@ -326,7 +334,7 @@ def calculate_institutional_fundamentals(ticker: str):
             eva = nopat - (wacc * (total_equity + total_debt))
             return {
                 "sector_profile": "Manufacturing & Capital Goods",
-                "altman_z": {"score": z_score, "zone": z_zone, "status": z_status, "desc": "Calculated via audited industrial metrics."},
+                "altman_z": {"score": z_score, "zone": z_zone, "status": z_status, "desc": "Calculated via normalized industrial metrics."},
                 "dupont": {"roe": safe_float(round(roe * 100, 2)), "profit_margin": safe_float(round(net_margin * 100, 2)), "asset_turnover": safe_float(round(asset_turnover, 2)), "financial_leverage": safe_float(round(fin_leverage, 2)), "verdict": "Asset Velocity & Leverage Engine"},
                 "eva": {"eva_cr": safe_float(round(eva / 1e7, 2)), "nopat_cr": safe_float(round(nopat / 1e7, 2)), "wacc_pct": safe_float(round(wacc * 100, 2)), "invested_capital_cr": safe_float(round((total_equity + total_debt) / 1e7, 2)), "status": "Value Creator" if eva > 0 else "Value Destroyer", "verdict": f"Economic profit: ₹{safe_float(round(eva / 1e7, 2))} Cr"},
                 "forensics": {"piotroski_f": {"score": 6, "status": "Moderate Health", "badge": "yellow", "desc": "Sound operational solvency."}, "beneish_m": {"score": -2.45, "verdict": "Unlikely Manipulator", "badge": "green", "desc": "Standard forensic accrual test."}}
@@ -455,7 +463,7 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
         raw_data = pd.concat([raw_data, today_row], ignore_index=True)
 
     master_df = generate_hybrid_features(raw_data)
-    latest_atr_abs = safe_float(master_df['ATR'].iloc[-1], current_live_price * 0.02) # Absolute ATR in Rupees
+    latest_atr_abs = safe_float(master_df['ATR'].iloc[-1], current_live_price * 0.02)
 
     forecast_payload = None
     quarterly_payload = None
@@ -490,7 +498,6 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
             "lower_bound": [round(float(p), 2) for p in lower_bound]
         }
         
-        # Quarterly Slice (Approx 63 trading days)
         q_day = 63 if len(forecast_path) > 63 else len(forecast_path) - 1
         quarterly_payload = {
             "q_date": str(future_dates[q_day].date()),
@@ -601,7 +608,6 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
 
     fundamentals = calculate_institutional_fundamentals(ticker)
     
-    # Get Industry Info explicitly for the UI
     try:
         y_info = yf.Ticker(f"{ticker.replace('.NS', '')}.NS").info or {}
         ui_industry = y_info.get('industry', 'Unknown Industry')
