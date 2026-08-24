@@ -23,7 +23,6 @@ from google import genai
 from google.genai import types
 from datetime import datetime, timedelta
 
-# Optional import for CatBoost
 try:
     from catboost import CatBoostClassifier
     HAS_CATBOOST = True
@@ -123,7 +122,6 @@ def fetch_upstox_data_dynamic(instrument_key, years=3):
         pass
     return pd.DataFrame()
 
-# --- SECTOR-ADAPTIVE INSTITUTIONAL & FORENSIC ENGINE ---
 def detect_sector_profile(info_dict, ticker: str):
     sector = str(info_dict.get('sector', '')).lower()
     industry = str(info_dict.get('industry', '')).lower()
@@ -146,20 +144,51 @@ def calculate_institutional_fundamentals(ticker: str):
     info = {}
     bs, fin = None, None
     
+    # 1. API WATERFALL & SESSION SPOOFING
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'application/json'
+    })
+    
     try:
-        stock = yf.Ticker(f"{clean_sym}.NS")
+        stock = yf.Ticker(f"{clean_sym}.NS", session=session)
         info = stock.info or {}
         bs, fin = stock.balance_sheet, stock.financials
+        
+        # Secondary Waterfall: Fallback to BSE if NSE data is missing
         if (bs is None or bs.empty) or (fin is None or fin.empty):
-            stock = yf.Ticker(f"{clean_sym}.BO")
+            stock = yf.Ticker(f"{clean_sym}.BO", session=session)
             info = stock.info or {}
             bs, fin = stock.balance_sheet, stock.financials
+            
+        # 2. THE INSTITUTIONAL FAIL-SAFE (No Data = No Trade)
+        if (bs is None or bs.empty) or (fin is None or fin.empty):
+            return {
+                "sector_profile": "Data Unavailable",
+                "altman_z": {"score": 0.0, "zone": "Data Missing", "status": "grey", "desc": "Audited balance sheet data is unavailable for this asset."},
+                "dupont": {"roe": 0.0, "profit_margin": 0.0, "asset_turnover": 0.0, "financial_leverage": 0.0, "verdict": "Data Unavailable"},
+                "eva": {"eva_cr": 0.0, "nopat_cr": 0.0, "wacc_pct": 0.0, "invested_capital_cr": 0.0, "status": "Error", "verdict": "Could not fetch WACC / NOPAT."},
+                "forensics": {
+                    "piotroski_f": {"score": 0, "status": "Unavailable", "badge": "grey", "desc": "Audit failed due to missing statements."},
+                    "beneish_m": {"score": 0.0, "verdict": "Unavailable", "badge": "grey", "desc": "Forensic test aborted."}
+                }
+            }
     except Exception:
-        pass
+        return {
+            "sector_profile": "Data Feed Timeout",
+            "altman_z": {"score": 0.0, "zone": "API Blocked", "status": "grey", "desc": "Financial APIs are currently rate-limiting this request."},
+            "dupont": {"roe": 0.0, "profit_margin": 0.0, "asset_turnover": 0.0, "financial_leverage": 0.0, "verdict": "Data Unavailable"},
+            "eva": {"eva_cr": 0.0, "nopat_cr": 0.0, "wacc_pct": 0.0, "invested_capital_cr": 0.0, "status": "Error", "verdict": "Could not fetch WACC / NOPAT."},
+            "forensics": {
+                "piotroski_f": {"score": 0, "status": "Unavailable", "badge": "grey", "desc": "Audit failed due to missing balance sheet."},
+                "beneish_m": {"score": 0.0, "verdict": "Unavailable", "badge": "grey", "desc": "Forensic test aborted."}
+            }
+        }
 
     sector_type = detect_sector_profile(info, clean_sym)
 
-    # 1. BFSI (Banks / Insurance)
+    # 3. BFSI (Banks / Insurance)
     if sector_type == 'BFSI':
         market_cap = safe_float(info.get('marketCap'), 200000.0)
         net_income = 10000.0
@@ -219,7 +248,7 @@ def calculate_institutional_fundamentals(ticker: str):
             }
         }
 
-    # 2. Technology & Services
+    # 4. Technology & Services
     elif sector_type == 'SERVICE_TECH':
         try:
             latest_bs = bs.iloc[:, 0]
@@ -283,7 +312,7 @@ def calculate_institutional_fundamentals(ticker: str):
         except Exception:
             pass
 
-    # 3. Manufacturing & Capital Goods
+    # 5. Manufacturing & Capital Goods
     try:
         latest_bs = bs.iloc[:, 0]
         latest_fin = fin.iloc[:, 0]
@@ -336,13 +365,13 @@ def calculate_institutional_fundamentals(ticker: str):
         }
     except Exception:
         return {
-            "sector_profile": "Data Feed Timeout",
-            "altman_z": {"score": 0.0, "zone": "API Blocked", "status": "grey", "desc": "Financial APIs are currently rate-limiting this request."},
+            "sector_profile": "Data Parsing Error",
+            "altman_z": {"score": 0.0, "zone": "Data Missing", "status": "grey", "desc": "Failed to parse balance sheet vectors."},
             "dupont": {"roe": 0.0, "profit_margin": 0.0, "asset_turnover": 0.0, "financial_leverage": 0.0, "verdict": "Data Unavailable"},
-            "eva": {"eva_cr": 0.0, "nopat_cr": 0.0, "wacc_pct": 0.0, "invested_capital_cr": 0.0, "status": "Error", "verdict": "Could not fetch WACC / NOPAT."},
+            "eva": {"eva_cr": 0.0, "nopat_cr": 0.0, "wacc_pct": 0.0, "invested_capital_cr": 0.0, "status": "Error", "verdict": "Could not fetch metrics."},
             "forensics": {
-                "piotroski_f": {"score": 0, "status": "Unavailable", "badge": "grey", "desc": "Audit failed due to missing balance sheet."},
-                "beneish_m": {"score": 0.0, "verdict": "Unavailable", "badge": "grey", "desc": "Forensic test aborted."}
+                "piotroski_f": {"score": 0, "status": "Unavailable", "badge": "grey", "desc": "Audit failed."},
+                "beneish_m": {"score": 0.0, "verdict": "Unavailable", "badge": "grey", "desc": "Test aborted."}
             }
         }
 
