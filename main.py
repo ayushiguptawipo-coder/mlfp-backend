@@ -29,10 +29,9 @@ try:
 except ImportError:
     HAS_CATBOOST = False
 
-# SECURE ENVIRONMENT VARIABLES
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 UPSTOX_ACCESS_TOKEN = os.environ.get("UPSTOX_ACCESS_TOKEN")
-FMP_API_KEY = os.environ.get("FMP_API_KEY", "") # Tier 4 Key
+FMP_API_KEY = os.environ.get("FMP_API_KEY", "") 
 
 app = FastAPI(title="MLFP Quant Engine Pro API")
 
@@ -69,9 +68,7 @@ def safe_float(val, default=0.0):
     except Exception:
         return float(default)
 
-# --- THE UNIVERSAL SAFETY NET ALGORITHM ---
 def apply_safety_net(val, min_val, max_val, default_val):
-    """Clamps distorted database anomalies back to realistic industry bounds."""
     try:
         v = float(val)
         if pd.isna(v) or np.isnan(v) or np.isinf(v):
@@ -163,10 +160,8 @@ def calculate_institutional_fundamentals(ticker: str):
     clean_sym = ticker.upper().replace(".NS", "").replace(".BO", "")
     data_source_flag = "None"
     
-    # Unified Variables
     revenue = net_income = total_assets = total_equity = total_debt = total_cash = ebit = working_capital = retained_earnings = market_cap = 0.0
 
-    # TIER 1: UPSTOX Fundamentals API
     instr_key = UPSTOX_KEYS.get(clean_sym)
     if instr_key:
         try:
@@ -187,7 +182,6 @@ def calculate_institutional_fundamentals(ticker: str):
                     data_source_flag = "Tier 1: Upstox API"
         except: pass
 
-    # TIER 2: YFINANCE
     if data_source_flag == "None":
         try:
             session = requests.Session()
@@ -226,7 +220,6 @@ def calculate_institutional_fundamentals(ticker: str):
                 data_source_flag = "Tier 2: YFinance API"
         except: pass
 
-    # TIER 3: JUGAAD
     if data_source_flag == "None":
         raw_jugaad_data = jugaad_fundamental_fetch(f"{clean_sym}.NS")
         if not raw_jugaad_data: raw_jugaad_data = jugaad_fundamental_fetch(f"{clean_sym}.BO")
@@ -245,7 +238,6 @@ def calculate_institutional_fundamentals(ticker: str):
             retained_earnings = total_assets * 0.15
             data_source_flag = "Tier 3: Jugaad Fallback"
 
-    # TIER 4: FMP (Financial Modeling Prep)
     if data_source_flag == "None" and FMP_API_KEY:
         try:
             url_quote = f"https://financialmodelingprep.com/api/v3/quote/{clean_sym}.NS?apikey={FMP_API_KEY}"
@@ -274,7 +266,6 @@ def calculate_institutional_fundamentals(ticker: str):
                 data_source_flag = "Tier 4: FMP API"
         except: pass
 
-    # TIER 5: AI AGENT FALLBACK (Deterministic)
     if data_source_flag == "None":
         try:
             client = genai.Client(api_key=GEMINI_API_KEY)
@@ -322,7 +313,6 @@ def calculate_institutional_fundamentals(ticker: str):
                 "forensics": {"piotroski_f": {"score": 0, "status": "Unavailable", "badge": "grey", "desc": "Audit failed."}, "beneish_m": {"score": 0.0, "verdict": "Unavailable", "badge": "grey", "desc": "Forensic test aborted."}}
             }
 
-    # --- UNIFIED MATH & UNIVERSAL SAFETY NET BLOCK ---
     total_liabilities = total_assets - total_equity
     if total_liabilities <= 0: total_liabilities = 1.0
 
@@ -332,7 +322,6 @@ def calculate_institutional_fundamentals(ticker: str):
         if revenue <= 0: revenue = net_income * 3.5
         
         roe_raw = (net_income / total_equity) if total_equity > 0 else 0.155
-        # TIGHTENED BOUNDARY: Minimum acceptable ROE for BFSI is now 12% (0.12)
         roe = apply_safety_net(roe_raw, 0.12, 0.35, 0.145) 
         
         if roe != roe_raw:  
@@ -444,6 +433,55 @@ def generate_hybrid_features(df):
 @app.api_route("/", methods=["GET", "HEAD"])
 def home():
     return {"status": "MLFP Quant Engine Pro API is online."}
+
+# NEW: MARKET OVERVIEW ENDPOINT
+@app.get("/api/market-overview")
+def get_market_overview():
+    indices = [
+        {"name": "Nifty 50", "key": "NSE_INDEX|Nifty 50", "yf_ticker": "^NSEI"},
+        {"name": "Bank Nifty", "key": "NSE_INDEX|Nifty Bank", "yf_ticker": "^NSEBANK"},
+        {"name": "Nifty Next 50", "key": "NSE_INDEX|Nifty Next 50", "yf_ticker": "^NSMIDCP"}, 
+        {"name": "Midcap 150", "key": "NSE_INDEX|Nifty Midcap 150", "yf_ticker": ""},
+        {"name": "Smallcap 250", "key": "NSE_INDEX|Nifty Smlcap 250", "yf_ticker": ""}
+    ]
+    
+    quotes = fetch_live_quote([i["key"] for i in indices])
+    overview = []
+    
+    for idx in indices:
+        df = fetch_upstox_data_dynamic(idx["key"], years=1)
+        
+        # Safety net: If Upstox index historicals are blocked, fallback to YFinance
+        if df.empty and idx["yf_ticker"]:
+            try:
+                yf_df = yf.download(idx["yf_ticker"], period="1y", interval="1d", progress=False)
+                if not yf_df.empty:
+                    df = pd.DataFrame({'ClosePrice': yf_df['Close'].values})
+            except: pass
+            
+        sparkline = []
+        if not df.empty:
+            step = max(1, len(df) // 40)
+            sparkline = [float(round(x, 2)) for x in df['ClosePrice'].iloc[::step].tolist()]
+        
+        q_data = extract_quote_data(quotes, idx["name"], idx["key"])
+        live_price = safe_float(q_data.get('last_price', df['ClosePrice'].iloc[-1] if not df.empty else 0.0))
+        change_val = safe_float(q_data.get('net_change', 0.0))
+        
+        # Fallback for live price if Upstox live quote fails on indices
+        if live_price == 0.0 and sparkline:
+            live_price = sparkline[-1]
+            if len(sparkline) > 1:
+                change_val = sparkline[-1] - sparkline[-2]
+        
+        overview.append({
+            "name": idx["name"],
+            "price": float(round(live_price, 2)),
+            "change": float(round(change_val, 2)),
+            "sparkline": sparkline
+        })
+        
+    return sanitize_json({"overview": overview})
 
 @app.get("/api/search")
 def search_stock(q: str):
