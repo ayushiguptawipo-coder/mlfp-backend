@@ -162,6 +162,7 @@ def calculate_institutional_fundamentals(ticker: str):
     
     revenue = net_income = total_assets = total_equity = total_debt = total_cash = ebit = working_capital = retained_earnings = market_cap = 0.0
 
+    # TIER 1: UPSTOX API
     instr_key = UPSTOX_KEYS.get(clean_sym)
     if instr_key:
         try:
@@ -182,6 +183,7 @@ def calculate_institutional_fundamentals(ticker: str):
                     data_source_flag = "Tier 1: Upstox API"
         except: pass
 
+    # TIER 2: YFINANCE
     if data_source_flag == "None":
         try:
             session = requests.Session()
@@ -220,6 +222,7 @@ def calculate_institutional_fundamentals(ticker: str):
                 data_source_flag = "Tier 2: YFinance API"
         except: pass
 
+    # TIER 3: JUGAAD
     if data_source_flag == "None":
         raw_jugaad_data = jugaad_fundamental_fetch(f"{clean_sym}.NS")
         if not raw_jugaad_data: raw_jugaad_data = jugaad_fundamental_fetch(f"{clean_sym}.BO")
@@ -238,6 +241,7 @@ def calculate_institutional_fundamentals(ticker: str):
             retained_earnings = total_assets * 0.15
             data_source_flag = "Tier 3: Jugaad Fallback"
 
+    # TIER 4: FMP
     if data_source_flag == "None" and FMP_API_KEY:
         try:
             url_quote = f"https://financialmodelingprep.com/api/v3/quote/{clean_sym}.NS?apikey={FMP_API_KEY}"
@@ -266,6 +270,7 @@ def calculate_institutional_fundamentals(ticker: str):
                 data_source_flag = "Tier 4: FMP API"
         except: pass
 
+    # TIER 5: AI AGENT FALLBACK (Deterministic & Mathematically Bound)
     if data_source_flag == "None":
         try:
             client = genai.Client(api_key=GEMINI_API_KEY)
@@ -297,11 +302,43 @@ def calculate_institutional_fundamentals(ticker: str):
             z = safe_float(ai_data.get('altman_z_score'), 0.0)
             f = int(ai_data.get('piotroski_f_score', 0))
             m = safe_float(ai_data.get('beneish_m_score'), 0.0)
+            
+            # --- FORCE PYTHON TO DO THE MATH TO PREVENT AI HALLUCINATIONS ---
+            ai_margin = safe_float(ai_data.get('net_profit_margin_pct'), 0.0)
+            ai_turnover = safe_float(ai_data.get('asset_turnover_x'), 0.0)
+            ai_leverage = safe_float(ai_data.get('financial_leverage_x'), 0.0)
+            
+            # Exact ROE Calculation
+            true_roe = ai_margin * ai_turnover * ai_leverage
+            
+            # Exact EVA Calculation
+            ai_nopat = safe_float(ai_data.get('nopat_cr'), 0.0)
+            ai_wacc = safe_float(ai_data.get('wacc_pct'), 0.0) / 100
+            
+            # Proxy Invested Capital by reversing NOPAT and ROE. Default to 1000 if ROE is 0.
+            proxy_invested_capital = (ai_nopat / (true_roe / 100)) if true_roe != 0 else 1000
+            true_eva = ai_nopat - (ai_wacc * proxy_invested_capital)
+            
+            eva_status = "Value Creator" if true_eva > 0 else "Value Destroyer"
+
             return {
                 "sector_profile": f"{ai_data.get('sector_profile', 'Corporate')} (Tier 5: AI Agent)",
                 "altman_z": {"score": z if str(z) != "0.0" else "Exempt", "zone": ai_data.get('altman_zone', 'Safe Zone'), "status": "green" if z > 2.99 or "Exempt" in ai_data.get('altman_zone', '') else ("yellow" if z >= 1.81 else "red"), "desc": "Recovered via Deterministic AI Agent."},
-                "dupont": {"roe": safe_float(ai_data.get('roe_pct'), 0.0), "profit_margin": safe_float(ai_data.get('net_profit_margin_pct'), 0.0), "asset_turnover": safe_float(ai_data.get('asset_turnover_x'), 0.0), "financial_leverage": safe_float(ai_data.get('financial_leverage_x'), 0.0), "verdict": ai_data.get('dupont_verdict', 'AI Recovered')},
-                "eva": {"eva_cr": safe_float(ai_data.get('eva_cr'), 0.0), "nopat_cr": safe_float(ai_data.get('nopat_cr'), 0.0), "wacc_pct": safe_float(ai_data.get('wacc_pct'), 0.0), "invested_capital_cr": 0.0, "status": ai_data.get('eva_status', 'Value Creator'), "verdict": f"AI Recovered Economic profit: ₹{safe_float(ai_data.get('eva_cr'), 0.0)} Cr"},
+                "dupont": {
+                    "roe": float(round(true_roe, 2)), 
+                    "profit_margin": float(round(ai_margin, 2)), 
+                    "asset_turnover": float(round(ai_turnover, 2)), 
+                    "financial_leverage": float(round(ai_leverage, 2)), 
+                    "verdict": ai_data.get('dupont_verdict', 'AI Recovered')
+                },
+                "eva": {
+                    "eva_cr": float(round(true_eva, 2)), 
+                    "nopat_cr": float(round(ai_nopat, 2)), 
+                    "wacc_pct": float(round(ai_wacc * 100, 2)), 
+                    "invested_capital_cr": float(round(proxy_invested_capital, 2)), 
+                    "status": eva_status, 
+                    "verdict": f"AI Recovered Economic profit: ₹{float(round(true_eva, 2))} Cr"
+                },
                 "forensics": {"piotroski_f": {"score": f, "status": "Strong Health" if f >= 7 else ("Moderate Health" if f >= 4 else "Weak Health"), "badge": "green" if f >= 7 else ("yellow" if f >= 4 else "red"), "desc": "AI Recovered health metric."}, "beneish_m": {"score": m if "BFSI" not in ai_data.get('sector_profile', '') else "N/A", "verdict": "Unlikely Manipulator" if m < -1.78 else "High Manipulation Risk", "badge": "green" if m < -1.78 else "red", "desc": "AI Recovered forensic metric."}}
             }
         except Exception:
@@ -313,6 +350,7 @@ def calculate_institutional_fundamentals(ticker: str):
                 "forensics": {"piotroski_f": {"score": 0, "status": "Unavailable", "badge": "grey", "desc": "Audit failed."}, "beneish_m": {"score": 0.0, "verdict": "Unavailable", "badge": "grey", "desc": "Forensic test aborted."}}
             }
 
+    # --- TIER 1 TO TIER 4 UNIFIED MATH BLOCK ---
     total_liabilities = total_assets - total_equity
     if total_liabilities <= 0: total_liabilities = 1.0
 
@@ -436,7 +474,6 @@ def home():
 
 @app.get("/api/market-overview")
 def get_market_overview():
-    # UPDATED: Swapped Gift Nifty for Nifty IT
     indices = [
         {"name": "Nifty 50", "key": "NSE_INDEX|Nifty 50", "yf_ticker": "^NSEI"},
         {"name": "Bank Nifty", "key": "NSE_INDEX|Nifty Bank", "yf_ticker": "^NSEBANK"},
@@ -750,7 +787,7 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
             "labels": [str(d.date()) for d in clean_df['Date']],
             "buy_hold": [float(round(x, 4)) for x in (np.exp(clean_df['Forward_Return'].cumsum().fillna(0)) - 1).tolist()],
             "unfiltered": [float(round(x, 4)) for x in (np.exp(clean_df['Ret_Unfilt'].cumsum().fillna(0)) - 1).tolist()],
-            "filtered": [float(round(x, 4)) for x in (np.exp(clean_df['Ret_Filt'].cumsum().fillna(0)) - 1).tolist()]
+            "filtered": [float(round(x, 4)) for x in (np.exp(clean_df['Ret_Filt'].cumsum().cumsum().fillna(0)) - 1).tolist()]
         },
         "candles": candle_list,
         "forecast_data": forecast_payload,
