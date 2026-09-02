@@ -238,12 +238,12 @@ def calculate_institutional_fundamentals(ticker: str):
             total_cash = safe_float(fin_data.get('totalCash', {}).get('raw', 1000.0))
             ebit = safe_float(fin_data.get('ebitda', {}).get('raw', revenue * 0.15))
             market_cap = safe_float(raw_jugaad_data.get('price', {}).get('marketCap', {}).get('raw', 100000.0))
-            roe = safe_float(fin_data.get('returnOnEquity', {}).get('raw', 0.15))
-            total_equity = net_income / roe if roe > 0 else market_cap * 0.5
+            roe_jugaad = safe_float(fin_data.get('returnOnEquity', {}).get('raw', 0.15))
+            total_equity = net_income / roe_jugaad if roe_jugaad > 0 else market_cap * 0.5
             total_assets = total_equity + total_debt + total_cash
             working_capital = total_assets * 0.2
             retained_earnings = total_assets * 0.15
-            data_source_flag = "Tier 3: Jugaad Bypass API"
+            data_source_flag = "Tier 3: Jugaad Fallback"
 
     # TIER 4: FMP (Financial Modeling Prep)
     if data_source_flag == "None" and FMP_API_KEY:
@@ -332,7 +332,8 @@ def calculate_institutional_fundamentals(ticker: str):
         if revenue <= 0: revenue = net_income * 3.5
         
         roe_raw = (net_income / total_equity) if total_equity > 0 else 0.155
-        roe = apply_safety_net(roe_raw, 0.08, 0.35, 0.145) 
+        # TIGHTENED BOUNDARY: Minimum acceptable ROE for BFSI is now 12% (0.12)
+        roe = apply_safety_net(roe_raw, 0.12, 0.35, 0.145) 
         
         if roe != roe_raw:  
             net_income = total_equity * roe
