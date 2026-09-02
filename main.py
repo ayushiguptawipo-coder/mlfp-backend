@@ -298,7 +298,7 @@ def calculate_institutional_fundamentals(ticker: str):
                 "beneish_m_score": <float>
             }}"""
             resp = client.models.generate_content(
-                model='gemini-2.5-flash', 
+                model='gemini-3.5-flash', 
                 contents=prompt, 
                 config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.0)
             )
@@ -332,6 +332,7 @@ def calculate_institutional_fundamentals(ticker: str):
         if revenue <= 0: revenue = net_income * 3.5
         
         roe_raw = (net_income / total_equity) if total_equity > 0 else 0.155
+        # TIGHTENED BOUNDARY: Minimum acceptable ROE for BFSI is now 12% (0.12)
         roe = apply_safety_net(roe_raw, 0.12, 0.35, 0.145) 
         
         if roe != roe_raw:  
@@ -639,7 +640,7 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
         if headlines.strip():
             client = genai.Client(api_key=GEMINI_API_KEY)
             resp = client.models.generate_content(
-                model='gemini-2.5-flash', 
+                model='gemini-3.5-flash', 
                 contents=f"Analyze these recent news headlines for '{ticker}':\n{headlines}\nReturn ONLY a valid JSON: {{\"sentiment_score\": <float -1.0 to 1.0>, \"executive_summary\": \"<1 sentence summary without any double quotes inside>\"}}", 
                 config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.0)
             )
