@@ -10,3 +10,4 @@ catboost
 feedparser
 google-genai
 yfinance
+statsmodels
