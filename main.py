@@ -434,15 +434,15 @@ def generate_hybrid_features(df):
 def home():
     return {"status": "MLFP Quant Engine Pro API is online."}
 
-# NEW: MARKET OVERVIEW ENDPOINT
+# NEW: MARKET OVERVIEW ENDPOINT (Monthly Bar Charts)
 @app.get("/api/market-overview")
 def get_market_overview():
     indices = [
         {"name": "Nifty 50", "key": "NSE_INDEX|Nifty 50", "yf_ticker": "^NSEI"},
         {"name": "Bank Nifty", "key": "NSE_INDEX|Nifty Bank", "yf_ticker": "^NSEBANK"},
-        {"name": "Nifty Next 50", "key": "NSE_INDEX|Nifty Next 50", "yf_ticker": "^NSMIDCP"}, 
-        {"name": "Midcap 150", "key": "NSE_INDEX|Nifty Midcap 150", "yf_ticker": ""},
-        {"name": "Smallcap 250", "key": "NSE_INDEX|Nifty Smlcap 250", "yf_ticker": ""}
+        {"name": "Sensex", "key": "BSE_INDEX|SENSEX", "yf_ticker": "^BSESN"}, 
+        # Note: Gift Nifty lacks standard free API coverage. We proxy via Nifty for the bars if Upstox fails.
+        {"name": "Gift Nifty", "key": "NSE_INDEX|GIFT NIFTY", "yf_ticker": "^NSEI"} 
     ]
     
     quotes = fetch_live_quote([i["key"] for i in indices])
@@ -451,34 +451,42 @@ def get_market_overview():
     for idx in indices:
         df = fetch_upstox_data_dynamic(idx["key"], years=1)
         
-        # Safety net: If Upstox index historicals are blocked, fallback to YFinance
         if df.empty and idx["yf_ticker"]:
             try:
                 yf_df = yf.download(idx["yf_ticker"], period="1y", interval="1d", progress=False)
                 if not yf_df.empty:
-                    df = pd.DataFrame({'ClosePrice': yf_df['Close'].values})
+                    yf_df = yf_df.reset_index()
+                    yf_df.rename(columns={'Date': 'Date', 'Close': 'ClosePrice'}, inplace=True)
+                    yf_df['Date'] = pd.to_datetime(yf_df['Date']).dt.tz_localize(None)
+                    df = yf_df[['Date', 'ClosePrice']]
             except: pass
             
-        sparkline = []
+        bar_labels = []
+        bar_data = []
         if not df.empty:
-            step = max(1, len(df) // 40)
-            sparkline = [float(round(x, 2)) for x in df['ClosePrice'].iloc[::step].tolist()]
+            df['Month'] = df['Date'].dt.to_period('M')
+            monthly_closes = df.groupby('Month')['ClosePrice'].last()
+            monthly_returns = monthly_closes.pct_change().dropna() * 100
+            
+            recent_months = monthly_returns.tail(6)
+            bar_labels = [str(m.strftime('%b')) for m in recent_months.index]
+            bar_data = [float(round(val, 2)) for val in recent_months.values]
         
         q_data = extract_quote_data(quotes, idx["name"], idx["key"])
         live_price = safe_float(q_data.get('last_price', df['ClosePrice'].iloc[-1] if not df.empty else 0.0))
         change_val = safe_float(q_data.get('net_change', 0.0))
         
-        # Fallback for live price if Upstox live quote fails on indices
-        if live_price == 0.0 and sparkline:
-            live_price = sparkline[-1]
-            if len(sparkline) > 1:
-                change_val = sparkline[-1] - sparkline[-2]
+        if live_price == 0.0 and not df.empty:
+            live_price = df['ClosePrice'].iloc[-1]
+            if len(df) > 1:
+                change_val = live_price - df['ClosePrice'].iloc[-2]
         
         overview.append({
             "name": idx["name"],
             "price": float(round(live_price, 2)),
             "change": float(round(change_val, 2)),
-            "sparkline": sparkline
+            "bar_labels": bar_labels,
+            "bar_data": bar_data
         })
         
     return sanitize_json({"overview": overview})
