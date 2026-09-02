@@ -608,11 +608,19 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
 
     fundamentals = calculate_institutional_fundamentals(ticker)
     
+    # --- INDUSTRY FALLBACK FIX ---
+    industry_fallback = {
+        'HDFCBANK': 'Private Banking', 'SBIN': 'Public Banking', 'ICICIBANK': 'Private Banking',
+        'TCS': 'IT Services', 'INFY': 'IT Services', 'RELIANCE': 'Conglomerate'
+    }
+    clean_sym = ticker.upper().replace(".NS", "").replace(".BO", "")
     try:
-        y_info = yf.Ticker(f"{ticker.replace('.NS', '')}.NS").info or {}
-        ui_industry = y_info.get('industry', 'Unknown Industry')
+        y_info = yf.Ticker(f"{clean_sym}.NS").info or {}
+        ui_industry = y_info.get('industry')
+        if not ui_industry:
+            ui_industry = industry_fallback.get(clean_sym, 'Industry Data Blocked')
     except:
-        ui_industry = "Unknown Industry"
+        ui_industry = industry_fallback.get(clean_sym, 'Industry Data Blocked')
 
     response_payload = {
         "ticker": str(ticker),
