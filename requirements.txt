@@ -6,7 +6,8 @@ numpy
 scikit-learn
 xgboost
 lightgbm
-catboost
+statsmodels
+pandas-ta
 feedparser
 google-genai
 yfinance
