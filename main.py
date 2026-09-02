@@ -434,15 +434,14 @@ def generate_hybrid_features(df):
 def home():
     return {"status": "MLFP Quant Engine Pro API is online."}
 
-# NEW: MARKET OVERVIEW ENDPOINT (Monthly Bar Charts)
 @app.get("/api/market-overview")
 def get_market_overview():
+    # UPDATED: Swapped Gift Nifty for Nifty IT
     indices = [
         {"name": "Nifty 50", "key": "NSE_INDEX|Nifty 50", "yf_ticker": "^NSEI"},
         {"name": "Bank Nifty", "key": "NSE_INDEX|Nifty Bank", "yf_ticker": "^NSEBANK"},
         {"name": "Sensex", "key": "BSE_INDEX|SENSEX", "yf_ticker": "^BSESN"}, 
-        # Note: Gift Nifty lacks standard free API coverage. We proxy via Nifty for the bars if Upstox fails.
-        {"name": "Gift Nifty", "key": "NSE_INDEX|GIFT NIFTY", "yf_ticker": "^NSEI"} 
+        {"name": "Nifty IT", "key": "NSE_INDEX|Nifty IT", "yf_ticker": "^CNXIT"} 
     ]
     
     quotes = fetch_live_quote([i["key"] for i in indices])
