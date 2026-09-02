@@ -32,6 +32,7 @@ except ImportError:
 # SECURE ENVIRONMENT VARIABLES
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 UPSTOX_ACCESS_TOKEN = os.environ.get("UPSTOX_ACCESS_TOKEN")
+FMP_API_KEY = os.environ.get("FMP_API_KEY", "") # Tier 4 Key
 
 app = FastAPI(title="MLFP Quant Engine Pro API")
 
@@ -68,7 +69,7 @@ def safe_float(val, default=0.0):
     except Exception:
         return float(default)
 
-# --- THE NEW SAFETY NET ALGORITHM ---
+# --- THE UNIVERSAL SAFETY NET ALGORITHM ---
 def apply_safety_net(val, min_val, max_val, default_val):
     """Clamps distorted database anomalies back to realistic industry bounds."""
     try:
@@ -160,32 +161,121 @@ def jugaad_fundamental_fetch(ticker):
 
 def calculate_institutional_fundamentals(ticker: str):
     clean_sym = ticker.upper().replace(".NS", "").replace(".BO", "")
-    info = {}
-    bs, fin = None, None
-    raw_jugaad_data = None
-    data_source_flag = "Tier 1: YFinance API"
+    data_source_flag = "None"
+    
+    # Unified Variables
+    revenue = net_income = total_assets = total_equity = total_debt = total_cash = ebit = working_capital = retained_earnings = market_cap = 0.0
 
-    try:
-        session = requests.Session()
-        session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
-        stock = yf.Ticker(f"{clean_sym}.NS", session=session)
-        info = stock.info or {}
-        bs, fin = stock.balance_sheet, stock.financials
-        if (bs is None or bs.empty) or (fin is None or fin.empty):
-            stock = yf.Ticker(f"{clean_sym}.BO", session=session)
+    # TIER 1: UPSTOX Fundamentals API
+    instr_key = UPSTOX_KEYS.get(clean_sym)
+    if instr_key:
+        try:
+            url = f'https://api.upstox.com/v2/fundamentals/{urllib.parse.quote(instr_key)}'
+            res = requests.get(url, headers={'Accept': 'application/json', 'Authorization': f'Bearer {UPSTOX_ACCESS_TOKEN}'}, timeout=4)
+            if res.status_code == 200:
+                data = res.json().get('data', {})
+                if data:
+                    revenue = safe_float(data.get('total_revenue'))
+                    net_income = safe_float(data.get('net_income'))
+                    total_assets = safe_float(data.get('total_assets'))
+                    total_equity = safe_float(data.get('total_equity'))
+                    total_debt = safe_float(data.get('total_debt'))
+                    ebit = safe_float(data.get('ebit', revenue * 0.15))
+                    working_capital = safe_float(data.get('working_capital', total_assets * 0.2))
+                    retained_earnings = safe_float(data.get('retained_earnings', total_assets * 0.15))
+                    market_cap = safe_float(data.get('market_cap', total_equity * 2.0))
+                    data_source_flag = "Tier 1: Upstox API"
+        except: pass
+
+    # TIER 2: YFINANCE
+    if data_source_flag == "None":
+        try:
+            session = requests.Session()
+            session.headers.update({'User-Agent': 'Mozilla/5.0'})
+            stock = yf.Ticker(f"{clean_sym}.NS", session=session)
             info = stock.info or {}
-            bs, fin = stock.balance_sheet, stock.financials
-    except Exception:
-        pass
+            bs = stock.balance_sheet
+            fin = stock.financials
+            if bs is not None and not bs.empty and fin is not None and not fin.empty:
+                latest_bs = bs.iloc[:, 0]
+                latest_fin = fin.iloc[:, 0]
+                
+                raw_assets = safe_float(latest_bs.get('Total Assets'), 1.0)
+                raw_mcap = safe_float(info.get('marketCap'), 1.0)
+                scale_factor = 1.0
+                if raw_assets > 10.0 and raw_mcap > 10.0:
+                    ratio = raw_mcap / raw_assets
+                    if ratio > 500000: scale_factor = 1000000.0  
+                    elif ratio > 500: scale_factor = 1000.0     
+                
+                total_assets = raw_assets * scale_factor
+                total_equity = safe_float(latest_bs.get('Stockholders Equity'), (total_assets * 0.4) / scale_factor) * scale_factor
+                total_debt = safe_float(latest_bs.get('Total Debt', latest_bs.get('Long Term Debt')), 0.0) * scale_factor
+                total_cash = safe_float(latest_bs.get('Cash And Cash Equivalents', 0.0)) * scale_factor
+                
+                current_assets = safe_float(latest_bs.get('Current Assets'), (total_assets * 0.4) / scale_factor) * scale_factor
+                current_liabilities = safe_float(latest_bs.get('Current Liabilities'), (total_assets * 0.2) / scale_factor) * scale_factor
+                working_capital = current_assets - current_liabilities
+                retained_earnings = safe_float(latest_bs.get('Retained Earnings'), (total_assets * 0.15) / scale_factor) * scale_factor
+                
+                revenue = safe_float(latest_fin.get('Total Revenue'), 1.0) * scale_factor
+                net_income = safe_float(latest_fin.get('Net Income', latest_fin.get('Net Income Common Stockholders')), (revenue * 0.10) / scale_factor) * scale_factor
+                ebit = safe_float(latest_fin.get('EBIT', latest_fin.get('Operating Income')), (revenue * 0.15) / scale_factor) * scale_factor
+                market_cap = raw_mcap
+                
+                data_source_flag = "Tier 2: YFinance API"
+        except: pass
 
-    if (bs is None or bs.empty) or (fin is None or fin.empty):
+    # TIER 3: JUGAAD
+    if data_source_flag == "None":
         raw_jugaad_data = jugaad_fundamental_fetch(f"{clean_sym}.NS")
-        if not raw_jugaad_data:
-            raw_jugaad_data = jugaad_fundamental_fetch(f"{clean_sym}.BO")
+        if not raw_jugaad_data: raw_jugaad_data = jugaad_fundamental_fetch(f"{clean_sym}.BO")
         if raw_jugaad_data:
-            data_source_flag = "Tier 2: Jugaad JSON Bypass"
+            fin_data = raw_jugaad_data.get('financialData', {})
+            net_income = safe_float(fin_data.get('netIncomeToCommon', {}).get('raw', 1000.0))
+            revenue = safe_float(fin_data.get('totalRevenue', {}).get('raw', 10000.0))
+            total_debt = safe_float(fin_data.get('totalDebt', {}).get('raw', 0.0))
+            total_cash = safe_float(fin_data.get('totalCash', {}).get('raw', 1000.0))
+            ebit = safe_float(fin_data.get('ebitda', {}).get('raw', revenue * 0.15))
+            market_cap = safe_float(raw_jugaad_data.get('price', {}).get('marketCap', {}).get('raw', 100000.0))
+            roe = safe_float(fin_data.get('returnOnEquity', {}).get('raw', 0.15))
+            total_equity = net_income / roe if roe > 0 else market_cap * 0.5
+            total_assets = total_equity + total_debt + total_cash
+            working_capital = total_assets * 0.2
+            retained_earnings = total_assets * 0.15
+            data_source_flag = "Tier 3: Jugaad Bypass API"
 
-    if ((bs is None or bs.empty) or (fin is None or fin.empty)) and not raw_jugaad_data:
+    # TIER 4: FMP (Financial Modeling Prep)
+    if data_source_flag == "None" and FMP_API_KEY:
+        try:
+            url_quote = f"https://financialmodelingprep.com/api/v3/quote/{clean_sym}.NS?apikey={FMP_API_KEY}"
+            url_metrics = f"https://financialmodelingprep.com/api/v3/key-metrics-ttm/{clean_sym}.NS?apikey={FMP_API_KEY}"
+            url_bs = f"https://financialmodelingprep.com/api/v3/balance-sheet-statement/{clean_sym}.NS?limit=1&apikey={FMP_API_KEY}"
+            
+            q_res = requests.get(url_quote, timeout=4)
+            m_res = requests.get(url_metrics, timeout=4)
+            bs_res = requests.get(url_bs, timeout=4)
+            
+            if q_res.status_code == 200 and m_res.status_code == 200 and bs_res.status_code == 200:
+                q_data = q_res.json()[0]
+                m_data = m_res.json()[0]
+                bs_data = bs_res.json()[0]
+                
+                market_cap = safe_float(q_data.get('marketCap'))
+                revenue = safe_float(m_data.get('revenuePerShareTTM')) * safe_float(q_data.get('sharesOutstanding'))
+                net_income = safe_float(m_data.get('netIncomePerShareTTM')) * safe_float(q_data.get('sharesOutstanding'))
+                total_assets = safe_float(bs_data.get('totalAssets'))
+                total_equity = safe_float(bs_data.get('totalStockholdersEquity'))
+                total_debt = safe_float(bs_data.get('totalDebt'))
+                total_cash = safe_float(bs_data.get('cashAndCashEquivalents'))
+                ebit = revenue * 0.15 
+                working_capital = safe_float(m_data.get('workingCapitalTTM', total_assets * 0.2))
+                retained_earnings = safe_float(bs_data.get('retainedEarnings', total_assets * 0.15))
+                data_source_flag = "Tier 4: FMP API"
+        except: pass
+
+    # TIER 5: AI AGENT FALLBACK (Deterministic)
+    if data_source_flag == "None":
         try:
             client = genai.Client(api_key=GEMINI_API_KEY)
             prompt = f"""You are a quantitative financial data parser. Primary APIs are down. 
@@ -207,7 +297,6 @@ def calculate_institutional_fundamentals(ticker: str):
                 "piotroski_f_score": <integer 0-9>,
                 "beneish_m_score": <float>
             }}"""
-            # AI SAFETY NET: temperature=0.0 ensures the AI does not hallucinate different numbers on refresh
             resp = client.models.generate_content(
                 model='gemini-3.5-flash', 
                 contents=prompt, 
@@ -218,141 +307,55 @@ def calculate_institutional_fundamentals(ticker: str):
             f = int(ai_data.get('piotroski_f_score', 0))
             m = safe_float(ai_data.get('beneish_m_score'), 0.0)
             return {
-                "sector_profile": f"{ai_data.get('sector_profile', 'Corporate')} (Tier 3: AI Agent)",
+                "sector_profile": f"{ai_data.get('sector_profile', 'Corporate')} (Tier 5: AI Agent)",
                 "altman_z": {"score": z if str(z) != "0.0" else "Exempt", "zone": ai_data.get('altman_zone', 'Safe Zone'), "status": "green" if z > 2.99 or "Exempt" in ai_data.get('altman_zone', '') else ("yellow" if z >= 1.81 else "red"), "desc": "Recovered via Deterministic AI Agent."},
                 "dupont": {"roe": safe_float(ai_data.get('roe_pct'), 0.0), "profit_margin": safe_float(ai_data.get('net_profit_margin_pct'), 0.0), "asset_turnover": safe_float(ai_data.get('asset_turnover_x'), 0.0), "financial_leverage": safe_float(ai_data.get('financial_leverage_x'), 0.0), "verdict": ai_data.get('dupont_verdict', 'AI Recovered')},
                 "eva": {"eva_cr": safe_float(ai_data.get('eva_cr'), 0.0), "nopat_cr": safe_float(ai_data.get('nopat_cr'), 0.0), "wacc_pct": safe_float(ai_data.get('wacc_pct'), 0.0), "invested_capital_cr": 0.0, "status": ai_data.get('eva_status', 'Value Creator'), "verdict": f"AI Recovered Economic profit: ₹{safe_float(ai_data.get('eva_cr'), 0.0)} Cr"},
                 "forensics": {"piotroski_f": {"score": f, "status": "Strong Health" if f >= 7 else ("Moderate Health" if f >= 4 else "Weak Health"), "badge": "green" if f >= 7 else ("yellow" if f >= 4 else "red"), "desc": "AI Recovered health metric."}, "beneish_m": {"score": m if "BFSI" not in ai_data.get('sector_profile', '') else "N/A", "verdict": "Unlikely Manipulator" if m < -1.78 else "High Manipulation Risk", "badge": "green" if m < -1.78 else "red", "desc": "AI Recovered forensic metric."}}
             }
         except Exception:
-            pass
-        return {
-            "sector_profile": "Data Feed Timeout (Tier 4 Fail)",
-            "altman_z": {"score": 0.0, "zone": "API Blocked", "status": "grey", "desc": "All data waterfalls unreachable."},
-            "dupont": {"roe": 0.0, "profit_margin": 0.0, "asset_turnover": 0.0, "financial_leverage": 0.0, "verdict": "Data Unavailable"},
-            "eva": {"eva_cr": 0.0, "nopat_cr": 0.0, "wacc_pct": 0.0, "invested_capital_cr": 0.0, "status": "Error", "verdict": "Could not fetch WACC / NOPAT."},
-            "forensics": {"piotroski_f": {"score": 0, "status": "Unavailable", "badge": "grey", "desc": "Audit failed."}, "beneish_m": {"score": 0.0, "verdict": "Unavailable", "badge": "grey", "desc": "Forensic test aborted."}}
-        }
-
-    sector_type = detect_sector_profile(info, clean_sym)
-
-    if raw_jugaad_data:
-        try:
-            fin_data = raw_jugaad_data.get('financialData', {})
-            prof_data = raw_jugaad_data.get('summaryProfile', {})
-            sector_type = detect_sector_profile({'sector': prof_data.get('sector', ''), 'industry': prof_data.get('industry', '')}, clean_sym)
-            net_income = safe_float(fin_data.get('netIncomeToCommon', {}).get('raw', 1000.0))
-            revenue = safe_float(fin_data.get('totalRevenue', {}).get('raw', 10000.0))
-            total_debt = safe_float(fin_data.get('totalDebt', {}).get('raw', 0.0))
-            total_cash = safe_float(fin_data.get('totalCash', {}).get('raw', 1000.0))
-            ebitda = safe_float(fin_data.get('ebitda', {}).get('raw', revenue * 0.15))
-            market_cap = safe_float(raw_jugaad_data.get('price', {}).get('marketCap', {}).get('raw', 100000.0))
-            
-            roe_raw = safe_float(fin_data.get('returnOnEquity', {}).get('raw', 0.15))
-            net_margin_raw = safe_float(fin_data.get('profitMargins', {}).get('raw', 0.10))
-            
-            total_equity = net_income / roe_raw if roe_raw > 0 else market_cap * 0.5
-            total_assets = total_equity + total_debt + total_cash
-
-            if sector_type == 'BFSI':
-                roe = apply_safety_net(roe_raw, 0.08, 0.30, 0.145)
-                margin = apply_safety_net(net_margin_raw, 0.05, 0.50, 0.22)
-                asset_turnover = apply_safety_net(revenue / total_assets if total_assets > 0 else 0.08, 0.02, 0.25, 0.08)
-                leverage = apply_safety_net(total_assets / total_equity if total_equity > 0 else 9.5, 4.0, 20.0, 9.5)
-                
-                return {
-                    "sector_profile": f"BFSI ({data_source_flag})",
-                    "altman_z": {"score": "Exempt", "zone": "BFSI Exemption", "status": "green", "desc": "Altman Z is exempt for banks & insurers."},
-                    "dupont": {"roe": safe_float(round(roe * 100, 2)), "profit_margin": safe_float(round(margin * 100, 2)), "asset_turnover": safe_float(round(asset_turnover, 2)), "financial_leverage": safe_float(round(leverage, 2)), "verdict": "Regulatory & Float Leverage Engine"},
-                    "eva": {"eva_cr": safe_float(round((net_income - (0.115 * total_equity)) / 1e7, 2)), "nopat_cr": safe_float(round(net_income / 1e7, 2)), "wacc_pct": 11.5, "invested_capital_cr": safe_float(round(total_equity / 1e7, 2)), "status": "Value Creator", "verdict": "Generated via Jugaad Fallback."},
-                    "forensics": {"piotroski_f": {"score": 7, "status": "Strong Health", "badge": "green", "desc": "Capital adequacy structurally sound."}, "beneish_m": {"score": "N/A", "verdict": "BFSI Exemption", "badge": "green", "desc": "Standard accrual metrics bypassed."}}
-                }
-            else:
-                roe = apply_safety_net(roe_raw, -0.40, 0.60, 0.15)
-                margin = apply_safety_net(net_margin_raw, -0.30, 0.50, 0.15)
-                asset_turnover = apply_safety_net(revenue / total_assets if total_assets > 0 else 0.8, 0.1, 4.0, 0.8)
-                leverage = apply_safety_net(total_assets / total_equity if total_equity > 0 else 1.5, 1.0, 10.0, 1.5)
-                
-                z_score_raw = 3.5 if total_debt < total_cash else 1.5
-                z_score = apply_safety_net(z_score_raw, -5.0, 15.0, 2.5)
-
-                return {
-                    "sector_profile": f"Corporate ({data_source_flag})",
-                    "altman_z": {"score": z_score, "zone": "Safe Zone" if z_score > 2.9 else "Grey Zone", "status": "green" if z_score > 2.9 else "yellow", "desc": "Estimated via Jugaad Bypass API."},
-                    "dupont": {"roe": safe_float(round(roe * 100, 2)), "profit_margin": safe_float(round(margin * 100, 2)), "asset_turnover": safe_float(round(asset_turnover, 2)), "financial_leverage": safe_float(round(leverage, 2)), "verdict": "Pricing Power Engine" if margin > 0.15 else "Asset Velocity Engine"},
-                    "eva": {"eva_cr": safe_float(round((ebitda*0.75 - (0.09 * (total_equity+total_debt))) / 1e7, 2)), "nopat_cr": safe_float(round(ebitda*0.75 / 1e7, 2)), "wacc_pct": 9.0, "invested_capital_cr": safe_float(round((total_equity+total_debt) / 1e7, 2)), "status": "Value Creator", "verdict": "Generated via Jugaad Fallback."},
-                    "forensics": {"piotroski_f": {"score": 6, "status": "Moderate Health", "badge": "yellow", "desc": "Jugaad basic health check."}, "beneish_m": {"score": -2.0, "verdict": "Unlikely Manipulator", "badge": "green", "desc": "Jugaad estimate."}}
-                }
-        except Exception:
-            pass
-
-    try:
-        latest_bs = bs.iloc[:, 0]
-        latest_fin = fin.iloc[:, 0]
-        
-        raw_assets = safe_float(latest_bs.get('Total Assets'), 1.0)
-        raw_mcap = safe_float(info.get('marketCap'), 1.0)
-        scale_factor = 1.0
-        
-        if raw_assets > 10.0 and raw_mcap > 10.0:
-            ratio = raw_mcap / raw_assets
-            if ratio > 500000:
-                scale_factor = 1000000.0  
-            elif ratio > 500:
-                scale_factor = 1000.0     
-        
-        if sector_type == 'BFSI':
-            market_cap = safe_float(info.get('marketCap'), 200000.0)
-            net_income = safe_float(latest_fin.get('Net Income', latest_fin.get('Net Income Common Stockholders')), 10000.0) * scale_factor
-            total_equity = safe_float(latest_bs.get('Stockholders Equity'), market_cap * 0.4 / scale_factor) * scale_factor
-            total_assets = safe_float(latest_bs.get('Total Assets'), (total_equity * 10.0) / scale_factor) * scale_factor
-            
-            # True Revenue Extraction for BFSI Safety Net
-            revenue = safe_float(latest_fin.get('Total Revenue'), net_income * 3.5) * scale_factor
-            if revenue <= 0: revenue = net_income * 3.5
-            
-            # SANITY CLAMPS (Fixes the HDFC Merger Anomaly)
-            roe_raw = (net_income / total_equity) if total_equity > 0 else 0.155
-            roe = apply_safety_net(roe_raw, 0.08, 0.35, 0.145) 
-            
-            if roe != roe_raw:  # If clamped, fix net income so EVA math is correct
-                net_income = total_equity * roe
-                
-            leverage_raw = (total_assets / total_equity) if total_equity > 0 else 9.5
-            leverage = apply_safety_net(leverage_raw, 4.0, 20.0, 9.5)
-            
-            margin_raw = net_income / revenue if revenue > 0 else 0.22
-            margin = apply_safety_net(margin_raw, 0.05, 0.50, 0.22)
-            
-            asset_turnover = apply_safety_net(revenue / total_assets if total_assets > 0 else 0.08, 0.01, 0.25, 0.08)
-            
-            eva = net_income - (0.115 * total_equity)
-            
             return {
-                "sector_profile": "BFSI (Financial / Insurance Institution)",
-                "altman_z": {"score": "Exempt", "zone": "BFSI Exemption", "status": "green", "desc": "Altman Z is exempt for banks & insurers."},
-                "dupont": {"roe": safe_float(round(roe * 100, 2)), "profit_margin": safe_float(round(margin * 100, 2)), "asset_turnover": safe_float(round(asset_turnover, 2)), "financial_leverage": safe_float(round(leverage, 2)), "verdict": "Regulatory & Float Leverage Engine"},
-                "eva": {"eva_cr": safe_float(round(eva / 1e7, 2)), "nopat_cr": safe_float(round(net_income / 1e7, 2)), "wacc_pct": 11.5, "invested_capital_cr": safe_float(round(total_equity / 1e7, 2)), "status": "Value Creator" if eva > 0 else "Value Destroyer", "verdict": f"Generates true net shareholder value."},
-                "forensics": {"piotroski_f": {"score": 7, "status": "Strong Health", "badge": "green", "desc": "Capital adequacy structurally sound (Sanity Checked)."}, "beneish_m": {"score": "N/A", "verdict": "BFSI Exemption", "badge": "green", "desc": "Accrual metrics bypassed."}}
+                "sector_profile": "Data Feed Timeout (Hard Fail)",
+                "altman_z": {"score": 0.0, "zone": "API Blocked", "status": "grey", "desc": "All data waterfalls unreachable."},
+                "dupont": {"roe": 0.0, "profit_margin": 0.0, "asset_turnover": 0.0, "financial_leverage": 0.0, "verdict": "Data Unavailable"},
+                "eva": {"eva_cr": 0.0, "nopat_cr": 0.0, "wacc_pct": 0.0, "invested_capital_cr": 0.0, "status": "Error", "verdict": "Could not fetch metrics."},
+                "forensics": {"piotroski_f": {"score": 0, "status": "Unavailable", "badge": "grey", "desc": "Audit failed."}, "beneish_m": {"score": 0.0, "verdict": "Unavailable", "badge": "grey", "desc": "Forensic test aborted."}}
             }
 
-        total_assets = safe_float(latest_bs.get('Total Assets'), 10000.0) * scale_factor
-        current_assets = safe_float(latest_bs.get('Current Assets'), (total_assets * 0.4) / scale_factor) * scale_factor
-        current_liabilities = safe_float(latest_bs.get('Current Liabilities'), (total_assets * 0.2) / scale_factor) * scale_factor
-        working_capital = current_assets - current_liabilities
-        retained_earnings = safe_float(latest_bs.get('Retained Earnings'), (total_assets * 0.15) / scale_factor) * scale_factor
-        total_equity = safe_float(latest_bs.get('Stockholders Equity'), (total_assets * 0.4) / scale_factor) * scale_factor
-        total_debt = safe_float(latest_bs.get('Total Debt', latest_bs.get('Long Term Debt')), 0.0) * scale_factor
-        
-        total_liabilities = total_assets - total_equity
-        if total_liabilities <= 0: total_liabilities = 1.0
-        
-        revenue = safe_float(latest_fin.get('Total Revenue'), 1.0) * scale_factor
-        ebit = safe_float(latest_fin.get('EBIT', latest_fin.get('Operating Income')), (revenue * 0.15) / scale_factor) * scale_factor
-        net_income = safe_float(latest_fin.get('Net Income'), (revenue * 0.10) / scale_factor) * scale_factor
-        market_cap = safe_float(info.get('marketCap'), total_equity * 2.0)
+    # --- UNIFIED MATH & UNIVERSAL SAFETY NET BLOCK ---
+    total_liabilities = total_assets - total_equity
+    if total_liabilities <= 0: total_liabilities = 1.0
 
-        # Tech and Manufacturing Safety Clamps
+    sector_type = detect_sector_profile({}, clean_sym)
+
+    if sector_type == 'BFSI':
+        if revenue <= 0: revenue = net_income * 3.5
+        
+        roe_raw = (net_income / total_equity) if total_equity > 0 else 0.155
+        roe = apply_safety_net(roe_raw, 0.08, 0.35, 0.145) 
+        
+        if roe != roe_raw:  
+            net_income = total_equity * roe
+            
+        leverage_raw = (total_assets / total_equity) if total_equity > 0 else 9.5
+        leverage = apply_safety_net(leverage_raw, 4.0, 20.0, 9.5)
+        
+        margin_raw = net_income / revenue if revenue > 0 else 0.22
+        margin = apply_safety_net(margin_raw, 0.05, 0.50, 0.22)
+        
+        asset_turnover = apply_safety_net(revenue / total_assets if total_assets > 0 else 0.08, 0.01, 0.25, 0.08)
+        
+        eva = net_income - (0.115 * total_equity)
+        
+        return {
+            "sector_profile": f"BFSI ({data_source_flag})",
+            "altman_z": {"score": "Exempt", "zone": "BFSI Exemption", "status": "green", "desc": "Altman Z is exempt for banks & insurers."},
+            "dupont": {"roe": safe_float(round(roe * 100, 2)), "profit_margin": safe_float(round(margin * 100, 2)), "asset_turnover": safe_float(round(asset_turnover, 2)), "financial_leverage": safe_float(round(leverage, 2)), "verdict": "Regulatory & Float Leverage Engine"},
+            "eva": {"eva_cr": safe_float(round(eva / 1e7, 2)), "nopat_cr": safe_float(round(net_income / 1e7, 2)), "wacc_pct": 11.5, "invested_capital_cr": safe_float(round(total_equity / 1e7, 2)), "status": "Value Creator" if eva > 0 else "Value Destroyer", "verdict": f"Generates true net shareholder value."},
+            "forensics": {"piotroski_f": {"score": 7, "status": "Strong Health", "badge": "green", "desc": "Capital adequacy structurally sound."}, "beneish_m": {"score": "N/A", "verdict": "BFSI Exemption", "badge": "green", "desc": "Accrual metrics bypassed."}}
+        }
+        
+    else:
         net_margin_raw = (net_income / revenue) if revenue > 0 else 0.10
         net_margin = apply_safety_net(net_margin_raw, -0.40, 0.60, 0.10)
         
@@ -372,7 +375,7 @@ def calculate_institutional_fundamentals(ticker: str):
             nopat = ebit * 0.75
             eva = nopat - (0.105 * total_equity)
             return {
-                "sector_profile": "Technology & Professional Services",
+                "sector_profile": f"Technology & Professional Services ({data_source_flag})",
                 "altman_z": {"score": z_score, "zone": f"{z_zone} (Z'' Non-Mfg)", "status": z_status, "desc": "Evaluated using normalized Altman Z'' model."},
                 "dupont": {"roe": safe_float(round(roe * 100, 2)), "profit_margin": safe_float(round(net_margin * 100, 2)), "asset_turnover": safe_float(round(asset_turnover, 2)), "financial_leverage": safe_float(round(fin_leverage, 2)), "verdict": "Pricing Power & Human Capital Engine"},
                 "eva": {"eva_cr": safe_float(round(eva / 1e7, 2)), "nopat_cr": safe_float(round(nopat / 1e7, 2)), "wacc_pct": 10.5, "invested_capital_cr": safe_float(round(total_equity / 1e7, 2)), "status": "Value Creator" if eva > 0 else "Value Destroyer", "verdict": f"Generates true economic profit."},
@@ -383,24 +386,16 @@ def calculate_institutional_fundamentals(ticker: str):
             z_score = apply_safety_net(z_score_raw, -4.0, 15.0, 2.2)
             z_zone, z_status = ("Safe Zone", "green") if z_score > 2.99 else (("Grey Zone", "yellow") if z_score >= 1.81 else ("Distress Zone", "red"))
             nopat = ebit * 0.75
-            wacc = 0.070 + (safe_float(info.get('beta'), 1.0) * 0.055)
+            wacc = 0.070 + (0.055)
             wacc = apply_safety_net(wacc, 0.05, 0.20, 0.09)
             eva = nopat - (wacc * (total_equity + total_debt))
             return {
-                "sector_profile": "Manufacturing & Capital Goods",
+                "sector_profile": f"Manufacturing & Capital Goods ({data_source_flag})",
                 "altman_z": {"score": z_score, "zone": z_zone, "status": z_status, "desc": "Calculated via normalized industrial metrics."},
                 "dupont": {"roe": safe_float(round(roe * 100, 2)), "profit_margin": safe_float(round(net_margin * 100, 2)), "asset_turnover": safe_float(round(asset_turnover, 2)), "financial_leverage": safe_float(round(fin_leverage, 2)), "verdict": "Asset Velocity & Leverage Engine"},
                 "eva": {"eva_cr": safe_float(round(eva / 1e7, 2)), "nopat_cr": safe_float(round(nopat / 1e7, 2)), "wacc_pct": safe_float(round(wacc * 100, 2)), "invested_capital_cr": safe_float(round((total_equity + total_debt) / 1e7, 2)), "status": "Value Creator" if eva > 0 else "Value Destroyer", "verdict": f"Economic profit: ₹{safe_float(round(eva / 1e7, 2))} Cr"},
                 "forensics": {"piotroski_f": {"score": 6, "status": "Moderate Health", "badge": "yellow", "desc": "Sound operational solvency."}, "beneish_m": {"score": -2.45, "verdict": "Unlikely Manipulator", "badge": "green", "desc": "Standard forensic accrual test."}}
             }
-    except Exception:
-        return {
-            "sector_profile": "Data Parsing Error (Tier 1)",
-            "altman_z": {"score": 0.0, "zone": "Error", "status": "grey", "desc": "Failed to parse API vectors."},
-            "dupont": {"roe": 0.0, "profit_margin": 0.0, "asset_turnover": 0.0, "financial_leverage": 0.0, "verdict": "Data Unavailable"},
-            "eva": {"eva_cr": 0.0, "nopat_cr": 0.0, "wacc_pct": 0.0, "invested_capital_cr": 0.0, "status": "Error", "verdict": "Could not fetch metrics."},
-            "forensics": {"piotroski_f": {"score": 0, "status": "Unavailable", "badge": "grey", "desc": "Audit failed."}, "beneish_m": {"score": 0.0, "verdict": "Unavailable", "badge": "grey", "desc": "Test aborted."}}
-        }
 
 def generate_hybrid_features(df):
     df = df.copy()
@@ -643,9 +638,9 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
         headlines = "\n".join([f"- {h.title}" for h in feed.entries[:10]])
         if headlines.strip():
             client = genai.Client(api_key=GEMINI_API_KEY)
-            # AI SAFETY NET: temperature=0.0 ensures the AI analysis does not hallucinate
             resp = client.models.generate_content(
-                model='gemini-3.5-flash', contents=f"Analyze these recent news headlines for '{ticker}':\n{headlines}\nReturn ONLY a valid JSON: {{\"sentiment_score\": <float -1.0 to 1.0>, \"executive_summary\": \"<1 sentence summary without any double quotes inside>\"}}", 
+                model='gemini-3.5-flash', 
+                contents=f"Analyze these recent news headlines for '{ticker}':\n{headlines}\nReturn ONLY a valid JSON: {{\"sentiment_score\": <float -1.0 to 1.0>, \"executive_summary\": \"<1 sentence summary without any double quotes inside>\"}}", 
                 config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.0)
             )
             raw_text = resp.text.strip()
