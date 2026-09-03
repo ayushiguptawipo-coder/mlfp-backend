@@ -162,26 +162,44 @@ def calculate_institutional_fundamentals(ticker: str):
     
     revenue = net_income = total_assets = total_equity = total_debt = total_cash = ebit = working_capital = retained_earnings = market_cap = 0.0
 
-    # TIER 1: UPSTOX API
+    # TIER 1: UPSTOX API (Proper ISIN Extraction)
     instr_key = UPSTOX_KEYS.get(clean_sym)
     if instr_key:
         try:
-            url = f'https://api.upstox.com/v2/fundamentals/{urllib.parse.quote(instr_key)}'
-            res = requests.get(url, headers={'Accept': 'application/json', 'Authorization': f'Bearer {UPSTOX_ACCESS_TOKEN}'}, timeout=4)
-            if res.status_code == 200:
-                data = res.json().get('data', {})
-                if data:
-                    revenue = safe_float(data.get('total_revenue'))
-                    net_income = safe_float(data.get('net_income'))
-                    total_assets = safe_float(data.get('total_assets'))
-                    total_equity = safe_float(data.get('total_equity'))
-                    total_debt = safe_float(data.get('total_debt'))
-                    ebit = safe_float(data.get('ebit', revenue * 0.15))
-                    working_capital = safe_float(data.get('working_capital', total_assets * 0.2))
-                    retained_earnings = safe_float(data.get('retained_earnings', total_assets * 0.15))
-                    market_cap = safe_float(data.get('market_cap', total_equity * 2.0))
+            # Extract the 12-character ISIN required by Upstox Fundamentals
+            isin = instr_key.split('|')[-1]
+            url_is = f'https://api.upstox.com/v2/fundamentals/{isin}/income-statement?type=consolidated&time_period=yearly'
+            url_bs = f'https://api.upstox.com/v2/fundamentals/{isin}/balance-sheet?type=consolidated'
+            headers = {'Accept': 'application/json', 'Authorization': f'Bearer {UPSTOX_ACCESS_TOKEN}'}
+            
+            res_is = requests.get(url_is, headers=headers, timeout=4)
+            res_bs = requests.get(url_bs, headers=headers, timeout=4)
+            
+            if res_is.status_code == 200 and res_bs.status_code == 200:
+                data_is = res_is.json().get('data', {}).get('income_statement', [])
+                data_bs = res_bs.json().get('data', {}).get('history', [])
+                
+                if data_is and data_bs:
+                    for item in data_is:
+                        cat = item.get('category')
+                        hist = item.get('historical_values', [])
+                        if hist:
+                            val = safe_float(hist[0].get('value'))
+                            if cat == 'revenue': revenue = val
+                            elif cat == 'operating_profit': ebit = val
+                            elif cat == 'net_profit': net_income = val
+                            
+                    total_assets = safe_float(data_bs[0].get('total_asset'))
+                    total_liab = safe_float(data_bs[0].get('total_liability'))
+                    total_equity = total_assets - total_liab
+                    total_debt = total_liab 
+                    
+                    working_capital = total_assets * 0.2
+                    retained_earnings = total_assets * 0.15
+                    market_cap = total_equity * 2.0
                     data_source_flag = "Tier 1: Upstox API"
-        except: pass
+        except Exception: 
+            pass
 
     # TIER 2: YFINANCE
     if data_source_flag == "None":
@@ -787,7 +805,7 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
             "labels": [str(d.date()) for d in clean_df['Date']],
             "buy_hold": [float(round(x, 4)) for x in (np.exp(clean_df['Forward_Return'].cumsum().fillna(0)) - 1).tolist()],
             "unfiltered": [float(round(x, 4)) for x in (np.exp(clean_df['Ret_Unfilt'].cumsum().fillna(0)) - 1).tolist()],
-            "filtered": [float(round(x, 4)) for x in (np.exp(clean_df['Ret_Filt'].cumsum().cumsum().fillna(0)) - 1).tolist()]
+            "filtered": [float(round(x, 4)) for x in (np.exp(clean_df['Ret_Filt'].cumsum().fillna(0)) - 1).tolist()]
         },
         "candles": candle_list,
         "forecast_data": forecast_payload,
