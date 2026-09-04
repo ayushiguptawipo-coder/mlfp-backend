@@ -33,6 +33,9 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 UPSTOX_ACCESS_TOKEN = os.environ.get("UPSTOX_ACCESS_TOKEN")
 FMP_API_KEY = os.environ.get("FMP_API_KEY", "") 
 
+# --- NEW: PROXY ARCHITECTURE ---
+YAHOO_PROXY_URL = os.environ.get("YAHOO_PROXY_URL", "")
+
 app = FastAPI(title="MLFP Quant Engine Pro API")
 
 app.add_middleware(
@@ -59,6 +62,19 @@ UPSTOX_KEYS = {
     'HDFCBANK': 'NSE_EQ|INE040A01034',
     'ICICIBANK': 'NSE_EQ|INE090A01021'
 }
+
+def get_yf_session():
+    """Generates a proxied session to bypass Render IP blocks on Yahoo Finance"""
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    })
+    if YAHOO_PROXY_URL:
+        session.proxies.update({
+            "http": YAHOO_PROXY_URL,
+            "https": YAHOO_PROXY_URL
+        })
+    return session
 
 def safe_float(val, default=0.0):
     try:
@@ -157,7 +173,8 @@ def jugaad_fundamental_fetch(ticker):
     try:
         url = f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{ticker}?modules=financialData,defaultKeyStatistics,summaryProfile,price"
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
-        res = requests.get(url, headers=headers, timeout=5)
+        proxies = {"http": YAHOO_PROXY_URL, "https": YAHOO_PROXY_URL} if YAHOO_PROXY_URL else None
+        res = requests.get(url, headers=headers, proxies=proxies, timeout=5)
         if res.status_code == 200:
             data = res.json().get('quoteSummary', {}).get('result', [])[0]
             if data: return data
@@ -204,9 +221,7 @@ def calculate_institutional_fundamentals(ticker: str):
 
     if data_source_flag == "None":
         try:
-            session = requests.Session()
-            session.headers.update({'User-Agent': 'Mozilla/5.0'})
-            stock = yf.Ticker(f"{clean_sym}.NS", session=session)
+            stock = yf.Ticker(f"{clean_sym}.NS", session=get_yf_session())
             info = stock.info or {}
             market_cap = safe_float(info.get('marketCap', 0.0))
             
@@ -269,13 +284,10 @@ def calculate_institutional_fundamentals(ticker: str):
 
     sector_type = detect_sector_profile({}, clean_sym)
 
-    # --- UNIVERSAL BASELINE PROXY (THE ZERO-BUG FIX) ---
-    # Ensure Market Cap is absolutely valid as the master anchor
     if market_cap <= 1000000:
-        try: market_cap = safe_float(yf.Ticker(f"{clean_sym}.NS").info.get('marketCap', 100000000000.0))
+        try: market_cap = safe_float(yf.Ticker(f"{clean_sym}.NS", session=get_yf_session()).info.get('marketCap', 100000000000.0))
         except: market_cap = 100000000000.0 
             
-    # Solve Mismatched API Units (e.g. YFinance giving 12k instead of 12,000,000,000)
     if total_assets > 0 and market_cap > 0:
         ratio = market_cap / total_assets
         if ratio > 5000:
@@ -283,14 +295,8 @@ def calculate_institutional_fundamentals(ticker: str):
             elif ratio > 500000: mult = 1000000.0
             elif ratio > 50000: mult = 100000.0
             else: mult = 10000.0
-            total_assets *= mult
-            total_equity *= mult
-            revenue *= mult
-            net_income *= mult
-            ebit *= mult
-            total_debt *= mult
+            total_assets *= mult; total_equity *= mult; revenue *= mult; net_income *= mult; ebit *= mult; total_debt *= mult
 
-    # Eradicate any lingering microscopic variables that cause ₹0 Cr outputs
     if total_equity <= 100000.0: total_equity = market_cap / 3.0
     if total_assets <= 100000.0: total_assets = total_equity * (9.0 if sector_type == 'BFSI' else 2.0)
     if revenue <= 100000.0: revenue = market_cap / (1.5 if sector_type == 'SERVICE_TECH' else 1.0)
@@ -301,7 +307,6 @@ def calculate_institutional_fundamentals(ticker: str):
     total_liabilities = total_assets - total_equity
     if total_liabilities <= 0: total_liabilities = 1.0
 
-    # --- MATHEMATICALLY LOCKED OUTPUT BLOCK ---
     if sector_type == 'BFSI':
         roe_raw = (net_income / total_equity)
         leverage_raw = (total_assets / total_equity)
@@ -438,7 +443,7 @@ def get_market_overview():
         
         if df.empty and idx["yf_ticker"]:
             try:
-                yf_df = yf.download(idx["yf_ticker"], period="1y", interval="1d", progress=False)
+                yf_df = yf.download(idx["yf_ticker"], period="1y", interval="1d", proxy=YAHOO_PROXY_URL if YAHOO_PROXY_URL else None, progress=False)
                 if not yf_df.empty:
                     yf_df = yf_df.reset_index()
                     yf_df.rename(columns={'Date': 'Date', 'Close': 'ClosePrice'}, inplace=True)
@@ -697,7 +702,7 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
     }
     clean_sym = ticker.upper().replace(".NS", "").replace(".BO", "")
     try:
-        y_info = yf.Ticker(f"{clean_sym}.NS").info or {}
+        y_info = yf.Ticker(f"{clean_sym}.NS", session=get_yf_session()).info or {}
         ui_industry = y_info.get('industry')
         if not ui_industry:
             ui_industry = industry_fallback.get(clean_sym, 'Industry Data Blocked')
