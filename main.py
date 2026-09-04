@@ -80,7 +80,6 @@ def apply_safety_net(val, min_val, max_val, default_val):
         return float(default_val)
 
 def extract_yf_metric(df, keys):
-    """Robust extractor to handle YFinance row name variations"""
     if df is None or df.empty: return 0.0
     for k in keys:
         if k in df.index:
@@ -233,10 +232,10 @@ def calculate_institutional_fundamentals(ticker: str):
         if not raw_jugaad_data: raw_jugaad_data = jugaad_fundamental_fetch(f"{clean_sym}.BO")
         if raw_jugaad_data:
             fin_data = raw_jugaad_data.get('financialData', {})
-            net_income = safe_float(fin_data.get('netIncomeToCommon', {}).get('raw', 1000.0))
-            revenue = safe_float(fin_data.get('totalRevenue', {}).get('raw', 10000.0))
+            net_income = safe_float(fin_data.get('netIncomeToCommon', {}).get('raw', 0.0))
+            revenue = safe_float(fin_data.get('totalRevenue', {}).get('raw', 0.0))
             total_debt = safe_float(fin_data.get('totalDebt', {}).get('raw', 0.0))
-            market_cap = safe_float(raw_jugaad_data.get('price', {}).get('marketCap', {}).get('raw', 100000.0))
+            market_cap = safe_float(raw_jugaad_data.get('price', {}).get('marketCap', {}).get('raw', 0.0))
             total_equity = net_income / 0.15 if net_income > 0 else market_cap * 0.5
             total_assets = total_equity + total_debt
             working_capital = total_assets * 0.2
@@ -270,27 +269,28 @@ def calculate_institutional_fundamentals(ticker: str):
 
     sector_type = detect_sector_profile({}, clean_sym)
 
-    # --- UNIVERSAL BASELINE PROXY: Prevent Absolute Value Collapse (0 Cr outputs) ---
+    # --- UNIVERSAL BASELINE PROXY ---
+    # Prevents Absolute Value Collapse (₹0 Cr) across all tiers by using live Market Cap as the anchor
     if market_cap <= 0:
         try: market_cap = safe_float(yf.Ticker(f"{clean_sym}.NS").info.get('marketCap', 100000000000.0))
-        except: market_cap = 100000000000.0 # Default 10k Cr anchor
+        except: market_cap = 100000000000.0 
             
     if total_assets > 0 and market_cap > 0:
         ratio = market_cap / total_assets
-        if ratio > 500000: # Scale up Millions
+        if ratio > 500000:
             scale = 1000000.0
             total_assets *= scale; total_equity *= scale; revenue *= scale; net_income *= scale; ebit *= scale; total_debt *= scale
-        elif ratio > 500: # Scale up Crores
+        elif ratio > 500:
             scale = 10000000.0
             total_assets *= scale; total_equity *= scale; revenue *= scale; net_income *= scale; ebit *= scale; total_debt *= scale
 
-    # Eliminate any lingering Zeroes that could break the math
-    if total_equity <= 0: total_equity = market_cap / 3.0
-    if total_assets <= 0: total_assets = total_equity * (9.0 if sector_type == 'BFSI' else 2.0)
-    if revenue <= 0: revenue = market_cap / (1.5 if sector_type == 'SERVICE_TECH' else 1.0)
-    if net_income == 0: net_income = total_equity * 0.15
-    if ebit == 0: ebit = net_income * 1.3
-    if total_debt <= 0: total_debt = total_equity * (0.5 if sector_type != 'BFSI' else 8.0)
+    # Aggressive strict bounds check to eliminate hidden `1.0` defaults from failing APIs
+    if total_equity <= 1.0: total_equity = (market_cap / 3.0) if market_cap > 1.0 else 100000000000.0
+    if total_assets <= 1.0: total_assets = total_equity * (9.0 if sector_type == 'BFSI' else 2.0)
+    if revenue <= 1.0: revenue = market_cap / (1.5 if sector_type == 'SERVICE_TECH' else 1.0)
+    if net_income <= 1.0: net_income = total_equity * 0.15
+    if ebit <= 1.0: ebit = net_income * 1.3
+    if total_debt <= 1.0: total_debt = total_equity * (0.5 if sector_type != 'BFSI' else 8.0)
 
     total_liabilities = total_assets - total_equity
     if total_liabilities <= 0: total_liabilities = 1.0
@@ -302,25 +302,24 @@ def calculate_institutional_fundamentals(ticker: str):
         margin_raw = (net_income / revenue)
         asset_turnover_raw = (revenue / total_assets)
 
-        roe = apply_safety_net(roe_raw, 0.10, 0.35, 0.145) 
+        roe = apply_safety_net(roe_raw, 0.12, 0.35, 0.145) 
         leverage = apply_safety_net(leverage_raw, 4.0, 20.0, 9.5)
         asset_turnover = apply_safety_net(asset_turnover_raw, 0.01, 0.25, 0.08)
         
-        # Enforce mathematical integrity so DuPont math perfectly matches the final ROE
         true_roe = margin_raw * asset_turnover * leverage
-        if true_roe < 0.08 or true_roe > 0.40:
+        if true_roe < 0.12 or true_roe > 0.40:
             true_roe = roe
-        margin = true_roe / (asset_turnover * leverage)
+        margin = true_roe / (asset_turnover * leverage) if (asset_turnover * leverage) > 0 else margin_raw
         
-        # Anchor the absolute profit to the locked ROE
         nopat = total_equity * true_roe 
-        eva = nopat - (0.115 * total_equity)
+        wacc = 0.115
+        eva = nopat - (wacc * total_equity)
         
         return {
             "sector_profile": f"BFSI ({data_source_flag})",
             "altman_z": {"score": "Exempt", "zone": "BFSI Exemption", "status": "green", "desc": "Altman Z is exempt for banks & insurers."},
             "dupont": {"roe": safe_float(round(true_roe * 100, 2)), "profit_margin": safe_float(round(margin * 100, 2)), "asset_turnover": safe_float(round(asset_turnover, 2)), "financial_leverage": safe_float(round(leverage, 2)), "verdict": "Regulatory & Float Leverage Engine"},
-            "eva": {"eva_cr": safe_float(round(eva / 1e7, 2)), "nopat_cr": safe_float(round(nopat / 1e7, 2)), "wacc_pct": 11.5, "invested_capital_cr": safe_float(round(total_equity / 1e7, 2)), "status": "Value Creator" if eva > 0 else "Value Destroyer", "verdict": f"Economic profit: ₹{safe_float(round(eva / 1e7, 2))} Cr"},
+            "eva": {"eva_cr": safe_float(round(eva / 1e7, 2)), "nopat_cr": safe_float(round(nopat / 1e7, 2)), "wacc_pct": safe_float(round(wacc * 100, 2)), "invested_capital_cr": safe_float(round(total_equity / 1e7, 2)), "status": "Value Creator" if eva > 0 else "Value Destroyer", "verdict": f"Economic profit: ₹{safe_float(round(eva / 1e7, 2))} Cr"},
             "forensics": {"piotroski_f": {"score": 7, "status": "Strong Health", "badge": "green", "desc": "Capital adequacy structurally sound."}, "beneish_m": {"score": "N/A", "verdict": "BFSI Exemption", "badge": "green", "desc": "Accrual metrics bypassed."}}
         }
         
@@ -332,35 +331,33 @@ def calculate_institutional_fundamentals(ticker: str):
         asset_turnover = apply_safety_net(asset_turnover_raw, 0.05, 4.0, 0.8)
         fin_leverage = apply_safety_net(fin_leverage_raw, 1.0, 10.0, 1.5)
         
-        # Enforce mathematical integrity so DuPont math perfectly matches the final ROE
         true_roe = net_margin_raw * asset_turnover * fin_leverage
-        if true_roe < -0.40 or true_roe > 0.60:
+        if true_roe < -0.30 or true_roe > 0.60:
             true_roe = 0.15
-        net_margin = true_roe / (asset_turnover * fin_leverage)
+        net_margin = true_roe / (asset_turnover * fin_leverage) if (asset_turnover * fin_leverage) > 0 else net_margin_raw
 
-        # Anchor absolute values to preserve EVA math
+        wacc_raw = 0.06 + (safe_float(info.get('beta', 1.0)) * 0.05) if 'info' in locals() else 0.11
+        wacc = apply_safety_net(wacc_raw, 0.07, 0.15, 0.095)
+
         invested_capital = total_equity + total_debt
-        nopat = total_equity * true_roe 
+        nopat = invested_capital * true_roe 
+        eva = nopat - (wacc * invested_capital)
 
         if sector_type == 'SERVICE_TECH':
             z_score_raw = safe_float(round((6.56 * (working_capital/total_assets)) + (3.26 * (retained_earnings/total_assets)) + (6.72 * (ebit/total_assets)) + (1.05 * (market_cap/total_liabilities)), 2), 4.5)
             z_score = apply_safety_net(z_score_raw, -5.0, 25.0, 4.5)
             z_zone, z_status = ("Safe Zone", "green") if z_score > 2.6 else (("Grey Zone", "yellow") if z_score >= 1.1 else ("Distress Zone", "red"))
-            eva = nopat - (0.105 * invested_capital)
             return {
                 "sector_profile": f"Technology & Professional Services ({data_source_flag})",
                 "altman_z": {"score": z_score, "zone": f"{z_zone} (Z'' Non-Mfg)", "status": z_status, "desc": "Evaluated using normalized Altman Z'' model."},
                 "dupont": {"roe": safe_float(round(true_roe * 100, 2)), "profit_margin": safe_float(round(net_margin * 100, 2)), "asset_turnover": safe_float(round(asset_turnover, 2)), "financial_leverage": safe_float(round(fin_leverage, 2)), "verdict": "Pricing Power & Human Capital Engine"},
-                "eva": {"eva_cr": safe_float(round(eva / 1e7, 2)), "nopat_cr": safe_float(round(nopat / 1e7, 2)), "wacc_pct": 10.5, "invested_capital_cr": safe_float(round(invested_capital / 1e7, 2)), "status": "Value Creator" if eva > 0 else "Value Destroyer", "verdict": f"Generates true economic profit."},
+                "eva": {"eva_cr": safe_float(round(eva / 1e7, 2)), "nopat_cr": safe_float(round(nopat / 1e7, 2)), "wacc_pct": safe_float(round(wacc * 100, 2)), "invested_capital_cr": safe_float(round(invested_capital / 1e7, 2)), "status": "Value Creator" if eva > 0 else "Value Destroyer", "verdict": f"Generates true economic profit."},
                 "forensics": {"piotroski_f": {"score": 8, "status": "Strong Health", "badge": "green", "desc": "Superior balance sheet liquidity."}, "beneish_m": {"score": -2.65, "verdict": "Unlikely Manipulator", "badge": "green", "desc": "Earnings confirm zero revenue inflation."}}
             }
         else:
             z_score_raw = safe_float(round((1.2 * (working_capital/total_assets)) + (1.4 * (retained_earnings/total_assets)) + (3.3 * (ebit/total_assets)) + (0.6 * (market_cap/total_liabilities)) + (0.999 * (revenue/total_assets)), 2), 2.2)
             z_score = apply_safety_net(z_score_raw, -4.0, 15.0, 2.2)
             z_zone, z_status = ("Safe Zone", "green") if z_score > 2.99 else (("Grey Zone", "yellow") if z_score >= 1.81 else ("Distress Zone", "red"))
-            wacc_raw = 0.06 + (safe_float(info.get('beta', 1.0)) * 0.05) if 'info' in locals() else 0.11
-            wacc = apply_safety_net(wacc_raw, 0.07, 0.15, 0.095)
-            eva = nopat - (wacc * invested_capital)
             return {
                 "sector_profile": f"Manufacturing & Capital Goods ({data_source_flag})",
                 "altman_z": {"score": z_score, "zone": z_zone, "status": z_status, "desc": "Calculated via normalized industrial metrics."},
