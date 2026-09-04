@@ -6,7 +6,6 @@ import re
 import json
 import urllib.parse
 import feedparser
-import yfinance as yf
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -31,10 +30,6 @@ except ImportError:
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 UPSTOX_ACCESS_TOKEN = os.environ.get("UPSTOX_ACCESS_TOKEN")
-FMP_API_KEY = os.environ.get("FMP_API_KEY", "") 
-
-# --- NEW: PROXY ARCHITECTURE ---
-YAHOO_PROXY_URL = os.environ.get("YAHOO_PROXY_URL", "")
 
 app = FastAPI(title="MLFP Quant Engine Pro API")
 
@@ -45,6 +40,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Load the Institutional Database into memory on startup
+try:
+    with open("fundamentals_db.json", "r") as f:
+        INSTITUTIONAL_DB = json.load(f)
+    print(f"Institutional DB Loaded: {len(INSTITUTIONAL_DB)} equities ready.")
+except Exception as e:
+    INSTITUTIONAL_DB = {}
+    print(f"Warning: fundamentals_db.json not found or corrupted. {e}")
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
@@ -63,19 +67,6 @@ UPSTOX_KEYS = {
     'ICICIBANK': 'NSE_EQ|INE090A01021'
 }
 
-def get_yf_session():
-    """Generates a proxied session to bypass Render IP blocks on Yahoo Finance"""
-    session = requests.Session()
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    })
-    if YAHOO_PROXY_URL:
-        session.proxies.update({
-            "http": YAHOO_PROXY_URL,
-            "https": YAHOO_PROXY_URL
-        })
-    return session
-
 def safe_float(val, default=0.0):
     try:
         if val is None or pd.isna(val) or np.isnan(float(val)) or np.isinf(float(val)):
@@ -84,39 +75,16 @@ def safe_float(val, default=0.0):
     except Exception:
         return float(default)
 
-def apply_safety_net(val, min_val, max_val, default_val):
-    try:
-        v = float(val)
-        if pd.isna(v) or np.isnan(v) or np.isinf(v):
-            return float(default_val)
-        if v < min_val or v > max_val:
-            return float(default_val)
-        return v
-    except Exception:
-        return float(default_val)
-
-def extract_yf_metric(df, keys):
-    if df is None or df.empty: return 0.0
-    for k in keys:
-        if k in df.index:
-            val = df.loc[k]
-            if isinstance(val, pd.Series): val = val.iloc[0]
-            if not pd.isna(val): return safe_float(val)
-    return 0.0
-
 def sanitize_json(data):
     if isinstance(data, dict):
         return {k: sanitize_json(v) for k, v in data.items()}
     elif isinstance(data, list):
         return [sanitize_json(v) for v in data]
     elif isinstance(data, (float, np.floating)):
-        if np.isnan(data) or np.isinf(data):
-            return 0.0
+        if np.isnan(data) or np.isinf(data): return 0.0
         return float(data)
-    elif isinstance(data, (int, np.integer)):
-        return int(data)
-    elif pd.isna(data):
-        return None
+    elif isinstance(data, (int, np.integer)): return int(data)
+    elif pd.isna(data): return None
     return data
 
 def fetch_live_quote(instrument_keys_list):
@@ -126,10 +94,8 @@ def fetch_live_quote(instrument_keys_list):
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {UPSTOX_ACCESS_TOKEN}'}
     try:
         res = requests.get(url, headers=headers, timeout=5)
-        if res.status_code == 200:
-            return res.json().get('data', {})
-    except Exception:
-        pass
+        if res.status_code == 200: return res.json().get('data', {})
+    except Exception: pass
     return {}
 
 def extract_quote_data(quotes_dict, ticker, instr_key):
@@ -154,230 +120,8 @@ def fetch_upstox_data_dynamic(instrument_key, years=3):
             df = pd.DataFrame(data, columns=['Date', 'Open', 'High', 'Low', 'ClosePrice', 'Volume', 'OI'])
             df['Date'] = pd.to_datetime(df['Date']).dt.tz_localize(None)
             return df.sort_values('Date').reset_index(drop=True)[['Date', 'Open', 'High', 'Low', 'ClosePrice', 'Volume']]
-    except Exception:
-        pass
+    except Exception: pass
     return pd.DataFrame()
-
-def detect_sector_profile(info_dict, ticker: str):
-    sector = str(info_dict.get('sector', '')).lower()
-    industry = str(info_dict.get('industry', '')).lower()
-    bfsi_keywords = ['bank', 'insurance', 'financial', 'asset management', 'credit', 'nbfc', 'holding company']
-    tech_keywords = ['technology', 'software', 'information technology', 'consulting', 'internet', 'communication']
-    for kw in bfsi_keywords:
-        if kw in sector or kw in industry or any(k in ticker.lower() for k in ['lic', 'bank', 'hdfc', 'icici', 'sbi', 'fin']): return 'BFSI'
-    for kw in tech_keywords:
-        if kw in sector or kw in industry or any(k in ticker.lower() for k in ['tcs', 'infy', 'wipro', 'hcl', 'techm']): return 'SERVICE_TECH'
-    return 'MANUFACTURING_CAPITAL'
-
-def jugaad_fundamental_fetch(ticker):
-    try:
-        url = f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{ticker}?modules=financialData,defaultKeyStatistics,summaryProfile,price"
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
-        proxies = {"http": YAHOO_PROXY_URL, "https": YAHOO_PROXY_URL} if YAHOO_PROXY_URL else None
-        res = requests.get(url, headers=headers, proxies=proxies, timeout=5)
-        if res.status_code == 200:
-            data = res.json().get('quoteSummary', {}).get('result', [])[0]
-            if data: return data
-    except Exception:
-        pass
-    return None
-
-def calculate_institutional_fundamentals(ticker: str):
-    clean_sym = ticker.upper().replace(".NS", "").replace(".BO", "")
-    data_source_flag = "None"
-    
-    revenue = net_income = total_assets = total_equity = total_debt = total_cash = ebit = working_capital = retained_earnings = market_cap = 0.0
-
-    instr_key = UPSTOX_KEYS.get(clean_sym)
-    if instr_key:
-        try:
-            isin = instr_key.split('|')[-1]
-            url_is = f'https://api.upstox.com/v2/fundamentals/{isin}/income-statement?type=consolidated&time_period=yearly'
-            url_bs = f'https://api.upstox.com/v2/fundamentals/{isin}/balance-sheet?type=consolidated'
-            headers = {'Accept': 'application/json', 'Authorization': f'Bearer {UPSTOX_ACCESS_TOKEN}'}
-            res_is = requests.get(url_is, headers=headers, timeout=2)
-            res_bs = requests.get(url_bs, headers=headers, timeout=2)
-            if res_is.status_code == 200 and res_bs.status_code == 200:
-                data_is = res_is.json().get('data', {}).get('income_statement', [])
-                data_bs = res_bs.json().get('data', {}).get('history', [])
-                if data_is and data_bs:
-                    for item in data_is:
-                        cat = item.get('category')
-                        hist = item.get('historical_values', [])
-                        if hist:
-                            val = safe_float(hist[0].get('value'))
-                            if cat == 'revenue': revenue = val
-                            elif cat == 'operating_profit': ebit = val
-                            elif cat == 'net_profit': net_income = val
-                    total_assets = safe_float(data_bs[0].get('total_asset'))
-                    total_liab = safe_float(data_bs[0].get('total_liability'))
-                    total_equity = total_assets - total_liab
-                    total_debt = total_liab 
-                    working_capital = total_assets * 0.2
-                    retained_earnings = total_assets * 0.15
-                    market_cap = total_equity * 2.0
-                    data_source_flag = "Tier 1: Upstox API"
-        except: pass
-
-    if data_source_flag == "None":
-        try:
-            stock = yf.Ticker(f"{clean_sym}.NS", session=get_yf_session())
-            info = stock.info or {}
-            market_cap = safe_float(info.get('marketCap', 0.0))
-            
-            bs = stock.balance_sheet
-            fin = stock.financials
-            if bs is not None and not bs.empty and fin is not None and not fin.empty:
-                total_assets = extract_yf_metric(bs, ['Total Assets'])
-                total_equity = extract_yf_metric(bs, ['Stockholders Equity', 'Total Equity Gross Minority Interest', 'Total Equity'])
-                total_debt = extract_yf_metric(bs, ['Total Debt', 'Long Term Debt'])
-                total_cash = extract_yf_metric(bs, ['Cash And Cash Equivalents', 'Cash'])
-                
-                revenue = extract_yf_metric(fin, ['Total Revenue', 'Operating Revenue', 'Revenue'])
-                net_income = extract_yf_metric(fin, ['Net Income', 'Net Income Common Stockholders', 'Net Income Including Noncontrolling Interests'])
-                ebit = extract_yf_metric(fin, ['EBIT', 'Operating Income'])
-                
-                working_capital = total_assets * 0.2
-                retained_earnings = total_assets * 0.15
-                data_source_flag = "Tier 2: YFinance API"
-        except: pass
-
-    if data_source_flag == "None":
-        raw_jugaad_data = jugaad_fundamental_fetch(f"{clean_sym}.NS")
-        if not raw_jugaad_data: raw_jugaad_data = jugaad_fundamental_fetch(f"{clean_sym}.BO")
-        if raw_jugaad_data:
-            fin_data = raw_jugaad_data.get('financialData', {})
-            net_income = safe_float(fin_data.get('netIncomeToCommon', {}).get('raw', 0.0))
-            revenue = safe_float(fin_data.get('totalRevenue', {}).get('raw', 0.0))
-            total_debt = safe_float(fin_data.get('totalDebt', {}).get('raw', 0.0))
-            market_cap = safe_float(raw_jugaad_data.get('price', {}).get('marketCap', {}).get('raw', 0.0))
-            total_equity = net_income / 0.15 if net_income > 0 else market_cap * 0.5
-            total_assets = total_equity + total_debt
-            working_capital = total_assets * 0.2
-            retained_earnings = total_assets * 0.15
-            ebit = revenue * 0.15
-            data_source_flag = "Tier 3: Jugaad Fallback"
-
-    if data_source_flag == "None" and FMP_API_KEY:
-        try:
-            url_quote = f"https://financialmodelingprep.com/api/v3/quote/{clean_sym}.NS?apikey={FMP_API_KEY}"
-            url_metrics = f"https://financialmodelingprep.com/api/v3/key-metrics-ttm/{clean_sym}.NS?apikey={FMP_API_KEY}"
-            url_bs = f"https://financialmodelingprep.com/api/v3/balance-sheet-statement/{clean_sym}.NS?limit=1&apikey={FMP_API_KEY}"
-            q_res = requests.get(url_quote, timeout=2)
-            m_res = requests.get(url_metrics, timeout=2)
-            bs_res = requests.get(url_bs, timeout=2)
-            if q_res.status_code == 200 and m_res.status_code == 200 and bs_res.status_code == 200:
-                q_data = q_res.json()[0]
-                m_data = m_res.json()[0]
-                bs_data = bs_res.json()[0]
-                market_cap = safe_float(q_data.get('marketCap'))
-                revenue = safe_float(m_data.get('revenuePerShareTTM')) * safe_float(q_data.get('sharesOutstanding'))
-                net_income = safe_float(m_data.get('netIncomePerShareTTM')) * safe_float(q_data.get('sharesOutstanding'))
-                total_assets = safe_float(bs_data.get('totalAssets'))
-                total_equity = safe_float(bs_data.get('totalStockholdersEquity'))
-                total_debt = safe_float(bs_data.get('totalDebt'))
-                ebit = revenue * 0.15 
-                working_capital = total_assets * 0.2
-                retained_earnings = total_assets * 0.15
-                data_source_flag = "Tier 4: FMP API"
-        except: pass
-
-    sector_type = detect_sector_profile({}, clean_sym)
-
-    if market_cap <= 1000000:
-        try: market_cap = safe_float(yf.Ticker(f"{clean_sym}.NS", session=get_yf_session()).info.get('marketCap', 100000000000.0))
-        except: market_cap = 100000000000.0 
-            
-    if total_assets > 0 and market_cap > 0:
-        ratio = market_cap / total_assets
-        if ratio > 5000:
-            if ratio > 5000000: mult = 10000000.0
-            elif ratio > 500000: mult = 1000000.0
-            elif ratio > 50000: mult = 100000.0
-            else: mult = 10000.0
-            total_assets *= mult; total_equity *= mult; revenue *= mult; net_income *= mult; ebit *= mult; total_debt *= mult
-
-    if total_equity <= 100000.0: total_equity = market_cap / 3.0
-    if total_assets <= 100000.0: total_assets = total_equity * (9.0 if sector_type == 'BFSI' else 2.0)
-    if revenue <= 100000.0: revenue = market_cap / (1.5 if sector_type == 'SERVICE_TECH' else 1.0)
-    if net_income <= 10000.0: net_income = total_equity * 0.15
-    if ebit <= 10000.0: ebit = net_income * 1.3
-    if total_debt <= 1000.0: total_debt = total_equity * (0.5 if sector_type != 'BFSI' else 8.0)
-
-    total_liabilities = total_assets - total_equity
-    if total_liabilities <= 0: total_liabilities = 1.0
-
-    if sector_type == 'BFSI':
-        roe_raw = (net_income / total_equity)
-        leverage_raw = (total_assets / total_equity)
-        margin_raw = (net_income / revenue)
-        asset_turnover_raw = (revenue / total_assets)
-
-        roe = apply_safety_net(roe_raw, 0.12, 0.35, 0.145) 
-        leverage = apply_safety_net(leverage_raw, 4.0, 20.0, 9.5)
-        asset_turnover = apply_safety_net(asset_turnover_raw, 0.01, 0.25, 0.08)
-        
-        true_roe = margin_raw * asset_turnover * leverage
-        if true_roe < 0.12 or true_roe > 0.40 or true_roe == 0.0:
-            true_roe = roe
-            
-        margin = true_roe / (asset_turnover * leverage) if (asset_turnover * leverage) > 0 else margin_raw
-        
-        nopat = total_equity * true_roe 
-        wacc = 0.115
-        eva = nopat - (wacc * total_equity)
-        
-        return {
-            "sector_profile": f"BFSI ({data_source_flag})",
-            "altman_z": {"score": "Exempt", "zone": "BFSI Exemption", "status": "green", "desc": "Altman Z is exempt for banks & insurers."},
-            "dupont": {"roe": safe_float(round(true_roe * 100, 2)), "profit_margin": safe_float(round(margin * 100, 2)), "asset_turnover": safe_float(round(asset_turnover, 2)), "financial_leverage": safe_float(round(leverage, 2)), "verdict": "Regulatory & Float Leverage Engine"},
-            "eva": {"eva_cr": safe_float(round(eva / 1e7, 2)), "nopat_cr": safe_float(round(nopat / 1e7, 2)), "wacc_pct": safe_float(round(wacc * 100, 2)), "invested_capital_cr": safe_float(round(total_equity / 1e7, 2)), "status": "Value Creator" if eva > 0 else "Value Destroyer", "verdict": f"Economic profit: ₹{safe_float(round(eva / 1e7, 2))} Cr"},
-            "forensics": {"piotroski_f": {"score": 7, "status": "Strong Health", "badge": "green", "desc": "Capital adequacy structurally sound."}, "beneish_m": {"score": "N/A", "verdict": "BFSI Exemption", "badge": "green", "desc": "Accrual metrics bypassed."}}
-        }
-        
-    else:
-        net_margin_raw = (net_income / revenue)
-        asset_turnover_raw = (revenue / total_assets)
-        fin_leverage_raw = (total_assets / total_equity)
-
-        asset_turnover = apply_safety_net(asset_turnover_raw, 0.05, 4.0, 0.8)
-        fin_leverage = apply_safety_net(fin_leverage_raw, 1.0, 10.0, 1.5)
-        
-        true_roe = net_margin_raw * asset_turnover * fin_leverage
-        if true_roe < -0.30 or true_roe > 0.60 or true_roe == 0.0:
-            true_roe = 0.155
-            
-        net_margin = true_roe / (asset_turnover * fin_leverage) if (asset_turnover * fin_leverage) > 0 else net_margin_raw
-
-        wacc_raw = 0.06 + (safe_float(info.get('beta', 1.0)) * 0.05) if 'info' in locals() else 0.11
-        wacc = apply_safety_net(wacc_raw, 0.07, 0.15, 0.095)
-
-        invested_capital = total_equity + total_debt
-        nopat = invested_capital * true_roe 
-        eva = nopat - (wacc * invested_capital)
-
-        if sector_type == 'SERVICE_TECH':
-            z_score_raw = safe_float(round((6.56 * (working_capital/total_assets)) + (3.26 * (retained_earnings/total_assets)) + (6.72 * (ebit/total_assets)) + (1.05 * (market_cap/total_liabilities)), 2), 4.5)
-            z_score = apply_safety_net(z_score_raw, -5.0, 25.0, 4.5)
-            z_zone, z_status = ("Safe Zone", "green") if z_score > 2.6 else (("Grey Zone", "yellow") if z_score >= 1.1 else ("Distress Zone", "red"))
-            return {
-                "sector_profile": f"Technology & Professional Services ({data_source_flag})",
-                "altman_z": {"score": z_score, "zone": f"{z_zone} (Z'' Non-Mfg)", "status": z_status, "desc": "Evaluated using normalized Altman Z'' model."},
-                "dupont": {"roe": safe_float(round(true_roe * 100, 2)), "profit_margin": safe_float(round(net_margin * 100, 2)), "asset_turnover": safe_float(round(asset_turnover, 2)), "financial_leverage": safe_float(round(fin_leverage, 2)), "verdict": "Pricing Power & Human Capital Engine"},
-                "eva": {"eva_cr": safe_float(round(eva / 1e7, 2)), "nopat_cr": safe_float(round(nopat / 1e7, 2)), "wacc_pct": safe_float(round(wacc * 100, 2)), "invested_capital_cr": safe_float(round(invested_capital / 1e7, 2)), "status": "Value Creator" if eva > 0 else "Value Destroyer", "verdict": f"Generates true economic profit."},
-                "forensics": {"piotroski_f": {"score": 8, "status": "Strong Health", "badge": "green", "desc": "Superior balance sheet liquidity."}, "beneish_m": {"score": -2.65, "verdict": "Unlikely Manipulator", "badge": "green", "desc": "Earnings confirm zero revenue inflation."}}
-            }
-        else:
-            z_score_raw = safe_float(round((1.2 * (working_capital/total_assets)) + (1.4 * (retained_earnings/total_assets)) + (3.3 * (ebit/total_assets)) + (0.6 * (market_cap/total_liabilities)) + (0.999 * (revenue/total_assets)), 2), 2.2)
-            z_score = apply_safety_net(z_score_raw, -4.0, 15.0, 2.2)
-            z_zone, z_status = ("Safe Zone", "green") if z_score > 2.99 else (("Grey Zone", "yellow") if z_score >= 1.81 else ("Distress Zone", "red"))
-            return {
-                "sector_profile": f"Manufacturing & Capital Goods ({data_source_flag})",
-                "altman_z": {"score": z_score, "zone": z_zone, "status": z_status, "desc": "Calculated via normalized industrial metrics."},
-                "dupont": {"roe": safe_float(round(true_roe * 100, 2)), "profit_margin": safe_float(round(net_margin * 100, 2)), "asset_turnover": safe_float(round(asset_turnover, 2)), "financial_leverage": safe_float(round(fin_leverage, 2)), "verdict": "Asset Velocity & Leverage Engine"},
-                "eva": {"eva_cr": safe_float(round(eva / 1e7, 2)), "nopat_cr": safe_float(round(nopat / 1e7, 2)), "wacc_pct": safe_float(round(wacc * 100, 2)), "invested_capital_cr": safe_float(round(invested_capital / 1e7, 2)), "status": "Value Creator" if eva > 0 else "Value Destroyer", "verdict": f"Economic profit: ₹{safe_float(round(eva / 1e7, 2))} Cr"},
-                "forensics": {"piotroski_f": {"score": 6, "status": "Moderate Health", "badge": "yellow", "desc": "Sound operational solvency."}, "beneish_m": {"score": -2.45, "verdict": "Unlikely Manipulator", "badge": "green", "desc": "Standard forensic accrual test."}}
-            }
 
 def generate_hybrid_features(df):
     df = df.copy()
@@ -429,10 +173,10 @@ def home():
 @app.get("/api/market-overview")
 def get_market_overview():
     indices = [
-        {"name": "Nifty 50", "key": "NSE_INDEX|Nifty 50", "yf_ticker": "^NSEI"},
-        {"name": "Bank Nifty", "key": "NSE_INDEX|Nifty Bank", "yf_ticker": "^NSEBANK"},
-        {"name": "Sensex", "key": "BSE_INDEX|SENSEX", "yf_ticker": "^BSESN"}, 
-        {"name": "Nifty IT", "key": "NSE_INDEX|Nifty IT", "yf_ticker": "^CNXIT"} 
+        {"name": "Nifty 50", "key": "NSE_INDEX|Nifty 50"},
+        {"name": "Bank Nifty", "key": "NSE_INDEX|Nifty Bank"},
+        {"name": "Sensex", "key": "BSE_INDEX|SENSEX"}, 
+        {"name": "Nifty IT", "key": "NSE_INDEX|Nifty IT"} 
     ]
     
     quotes = fetch_live_quote([i["key"] for i in indices])
@@ -440,24 +184,11 @@ def get_market_overview():
     
     for idx in indices:
         df = fetch_upstox_data_dynamic(idx["key"], years=1)
-        
-        if df.empty and idx["yf_ticker"]:
-            try:
-                yf_df = yf.download(idx["yf_ticker"], period="1y", interval="1d", proxy=YAHOO_PROXY_URL if YAHOO_PROXY_URL else None, progress=False)
-                if not yf_df.empty:
-                    yf_df = yf_df.reset_index()
-                    yf_df.rename(columns={'Date': 'Date', 'Close': 'ClosePrice'}, inplace=True)
-                    yf_df['Date'] = pd.to_datetime(yf_df['Date']).dt.tz_localize(None)
-                    df = yf_df[['Date', 'ClosePrice']]
-            except: pass
-            
-        bar_labels = []
-        bar_data = []
+        bar_labels, bar_data = [], []
         if not df.empty:
             df['Month'] = df['Date'].dt.to_period('M')
             monthly_closes = df.groupby('Month')['ClosePrice'].last()
             monthly_returns = monthly_closes.pct_change().dropna() * 100
-            
             recent_months = monthly_returns.tail(6)
             bar_labels = [str(m.strftime('%b')) for m in recent_months.index]
             bar_data = [float(round(val, 2)) for val in recent_months.values]
@@ -465,11 +196,6 @@ def get_market_overview():
         q_data = extract_quote_data(quotes, idx["name"], idx["key"])
         live_price = safe_float(q_data.get('last_price', df['ClosePrice'].iloc[-1] if not df.empty else 0.0))
         change_val = safe_float(q_data.get('net_change', 0.0))
-        
-        if live_price == 0.0 and not df.empty:
-            live_price = df['ClosePrice'].iloc[-1]
-            if len(df) > 1:
-                change_val = live_price - df['ClosePrice'].iloc[-2]
         
         overview.append({
             "name": idx["name"],
@@ -494,13 +220,9 @@ def search_stock(q: str):
             for item in data:
                 if item.get('segment') in ['NSE_EQ', 'BSE_EQ']:
                     results.append({"ticker": item.get('trading_symbol'), "name": item.get('name'), "instrument_key": item.get('instrument_key')})
-            unique_results = {}
-            for r in results:
-                if r['ticker'] not in unique_results:
-                    unique_results[r['ticker']] = r
+            unique_results = {r['ticker']: r for r in results}
             return {"results": list(unique_results.values())[:8]}
-    except Exception:
-        pass
+    except Exception: pass
     return {"results": []}
 
 @app.get("/api/scanner")
@@ -668,6 +390,7 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
     elif prob_up <= lower_bound: quant_signal = "NEUTRAL (Macro Bull Guard)" if is_macro_bull else "BEARISH"
     else: quant_signal = "NEUTRAL"
 
+    # Gemini News Fetcher
     try:
         q = urllib.parse.quote(f"{ticker} stock news India")
         rss_url = f"https://news.google.com/rss/search?q={q}&hl=en-IN&gl=IN&ceid=IN:en"
@@ -694,20 +417,28 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
     recent_candles_df = raw_data.tail(100)
     candle_list = [{"time": str(row['Date'].date()), "open": safe_float(row['Open']), "high": safe_float(row['High']), "low": safe_float(row['Low']), "close": safe_float(row['ClosePrice']), "volume": safe_float(row['Volume'])} for _, row in recent_candles_df.iterrows()]
 
-    fundamentals = calculate_institutional_fundamentals(ticker)
-    
-    industry_fallback = {
-        'HDFCBANK': 'Private Banking', 'SBIN': 'Public Banking', 'ICICIBANK': 'Private Banking',
-        'TCS': 'IT Services', 'INFY': 'IT Services', 'RELIANCE': 'Conglomerate'
-    }
+    # --- THE INSTITUTIONAL DATABASE QUERY ---
     clean_sym = ticker.upper().replace(".NS", "").replace(".BO", "")
-    try:
-        y_info = yf.Ticker(f"{clean_sym}.NS", session=get_yf_session()).info or {}
-        ui_industry = y_info.get('industry')
-        if not ui_industry:
-            ui_industry = industry_fallback.get(clean_sym, 'Industry Data Blocked')
-    except:
-        ui_industry = industry_fallback.get(clean_sym, 'Industry Data Blocked')
+    
+    # Check the loaded memory cache for the stock
+    company_fundamentals = INSTITUTIONAL_DB.get(clean_sym)
+    
+    if company_fundamentals:
+        fundamentals = company_fundamentals
+        ui_industry = "Database Connected"
+    else:
+        # Failsafe if ticker not in JSON
+        fundamentals = {
+            "sector_profile": "Unlisted / Not in Database",
+            "altman_z": {"score": 0.0, "zone": "Data Missing", "badge": "grey", "desc": "Company not indexed."},
+            "dupont": {"roe": 0.0, "profit_margin": 0.0, "asset_turnover": 0.0, "financial_leverage": 0.0, "verdict": "Data Missing"},
+            "eva": {"eva_cr": 0.0, "nopat_cr": 0.0, "wacc_pct": 0.0, "invested_capital_cr": 0.0, "status": "Unknown", "verdict": "Data Missing"},
+            "forensics": {
+                "piotroski_f": {"score": 0, "status": "Unknown", "badge": "grey", "desc": "Audit skipped."},
+                "beneish_m": {"score": 0.0, "verdict": "Unknown", "badge": "grey", "desc": "Audit skipped."}
+            }
+        }
+        ui_industry = "Data Missing"
 
     response_payload = {
         "ticker": str(ticker),
