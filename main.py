@@ -44,14 +44,15 @@ app.add_middleware(
 # Load the Institutional Database into memory on server boot
 INSTITUTIONAL_DB = {}
 try:
-    if os.path.exists("fundamentals_db.json"):
-        with open("fundamentals_db.json", "r") as f:
+    # UPDATED: Pointing to the new master database
+    if os.path.exists("fundamentals_db_master.json"):
+        with open("fundamentals_db_master.json", "r") as f:
             INSTITUTIONAL_DB = json.load(f)
         print(f"Institutional DB Successfully Loaded: {len(INSTITUTIONAL_DB)} equities ready.")
     else:
-        print("Warning: fundamentals_db.json not found in repository root. Running in fallback mode.")
+        print("Warning: fundamentals_db_master.json not found in repository root. Running in fallback mode.")
 except Exception as e:
-    print(f"Warning: Could not parse fundamentals_db.json: {e}")
+    print(f"Warning: Could not parse fundamentals_db_master.json: {e}")
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
@@ -427,6 +428,20 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
     if company_fundamentals:
         fundamentals = company_fundamentals
         ui_industry = fundamentals.get("sector_profile", "Database Connected")
+        
+        # =================================================================
+        # CRITICAL BFSI EVA INTERCEPTOR: Neutralizes false metrics for banks
+        # =================================================================
+        if ui_industry == "BFSI":
+            fundamentals["eva"] = {
+                "eva_cr": "N/A",
+                "nopat_cr": "N/A",
+                "wacc_pct": 11.5,
+                "invested_capital_cr": "N/A",
+                "status": "Exempt",
+                "verdict": "EVA calculations structurally exempt for Financial Institutions."
+            }
+            
     else:
         # Failsafe for equities currently queued in Colab ingestion
         fundamentals = {
