@@ -30,6 +30,8 @@ except ImportError:
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 UPSTOX_ACCESS_TOKEN = os.environ.get("UPSTOX_ACCESS_TOKEN")
+# NEW: Load Finnhub key for US stocks
+FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY")
 
 app = FastAPI(title="MLFP Quant Engine Pro API")
 
@@ -41,7 +43,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load the Institutional Database into memory on server boot
 INSTITUTIONAL_DB = {}
 try:
     if os.path.exists("fundamentals_db_master.json"):
@@ -49,17 +50,13 @@ try:
             INSTITUTIONAL_DB = json.load(f)
         print(f"Institutional DB Successfully Loaded: {len(INSTITUTIONAL_DB)} equities ready.")
     else:
-        print("Warning: fundamentals_db_master.json not found in repository root. Running in fallback mode.")
+        print("Warning: fundamentals_db_master.json not found.")
 except Exception as e:
     print(f"Warning: Could not parse fundamentals_db_master.json: {e}")
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    return JSONResponse(
-        status_code=400,
-        content={"detail": f"Backend Diagnostic: {str(exc)}"},
-        headers={"Access-Control-Allow-Origin": "*"}
-    )
+    return JSONResponse(status_code=400, content={"detail": f"Backend Diagnostic: {str(exc)}"}, headers={"Access-Control-Allow-Origin": "*"})
 
 UPSTOX_KEYS = {
     'SBIN': 'NSE_EQ|INE062A01020',
@@ -72,24 +69,21 @@ UPSTOX_KEYS = {
 
 def safe_float(val, default=0.0):
     try:
-        if val is None or pd.isna(val) or np.isnan(float(val)) or np.isinf(float(val)):
-            return float(default)
+        if val is None or pd.isna(val) or np.isnan(float(val)) or np.isinf(float(val)): return float(default)
         return float(val)
-    except Exception:
-        return float(default)
+    except: return float(default)
 
 def sanitize_json(data):
-    if isinstance(data, dict):
-        return {k: sanitize_json(v) for k, v in data.items()}
-    elif isinstance(data, list):
-        return [sanitize_json(v) for v in data]
-    elif isinstance(data, (float, np.floating)):
-        if np.isnan(data) or np.isinf(data): return 0.0
-        return float(data)
+    if isinstance(data, dict): return {k: sanitize_json(v) for k, v in data.items()}
+    elif isinstance(data, list): return [sanitize_json(v) for v in data]
+    elif isinstance(data, (float, np.floating)): return 0.0 if np.isnan(data) or np.isinf(data) else float(data)
     elif isinstance(data, (int, np.integer)): return int(data)
     elif pd.isna(data): return None
     return data
 
+# ==========================================
+# DATA FETCHERS: UPSTOX (INDIA) & FINNHUB (US)
+# ==========================================
 def fetch_live_quote(instrument_keys_list):
     if not instrument_keys_list: return {}
     keys_param = ",".join([urllib.parse.quote(k) for k in instrument_keys_list])
@@ -98,15 +92,14 @@ def fetch_live_quote(instrument_keys_list):
     try:
         res = requests.get(url, headers=headers, timeout=5)
         if res.status_code == 200: return res.json().get('data', {})
-    except Exception: pass
+    except: pass
     return {}
 
 def extract_quote_data(quotes_dict, ticker, instr_key):
     if not quotes_dict: return {}
     isin = instr_key.split('|')[-1] if '|' in instr_key else instr_key
     for k, v in quotes_dict.items():
-        if ticker in k or isin in k or instr_key in k or instr_key.replace('|', ':') in k:
-            return v
+        if ticker in k or isin in k or instr_key in k or instr_key.replace('|', ':') in k: return v
     return {}
 
 def fetch_upstox_data_dynamic(instrument_key, years=3):
@@ -123,7 +116,30 @@ def fetch_upstox_data_dynamic(instrument_key, years=3):
             df = pd.DataFrame(data, columns=['Date', 'Open', 'High', 'Low', 'ClosePrice', 'Volume', 'OI'])
             df['Date'] = pd.to_datetime(df['Date']).dt.tz_localize(None)
             return df.sort_values('Date').reset_index(drop=True)[['Date', 'Open', 'High', 'Low', 'ClosePrice', 'Volume']]
-    except Exception: pass
+    except: pass
+    return pd.DataFrame()
+
+# NEW: Finnhub US Data Fetcher
+def fetch_finnhub_data(ticker, years=3):
+    to_ts = int(datetime.now().timestamp())
+    from_ts = int((datetime.now() - timedelta(days=365 * years)).timestamp())
+    url = f"https://finnhub.io/api/v1/stock/candle?symbol={ticker}&resolution=D&from={from_ts}&to={to_ts}&token={FINNHUB_API_KEY}"
+    try:
+        res = requests.get(url, timeout=6)
+        if res.status_code == 200:
+            data = res.json()
+            if data.get('s') == 'ok':
+                df = pd.DataFrame({
+                    'Date': pd.to_datetime(data['t'], unit='s'),
+                    'Open': data['o'],
+                    'High': data['h'],
+                    'Low': data['l'],
+                    'ClosePrice': data['c'],
+                    'Volume': data['v']
+                })
+                return df
+    except Exception as e:
+        print(f"Finnhub Error: {e}")
     return pd.DataFrame()
 
 def generate_hybrid_features(df):
@@ -166,8 +182,7 @@ def generate_hybrid_features(df):
     df['AR1_Forecast'] = ar_preds
     df['Target_Direction'] = (df['Forward_Return'] > 0).astype(int)
     df['Rolling_Vol'] = df['Log_Returns'].rolling(window=10).std()
-    clean_df = df.dropna(subset=['Log_Returns_Lag2', 'RSI_14', 'MACD', 'ATR_14', 'AR1_Forecast']).reset_index(drop=True)
-    return clean_df
+    return df.dropna(subset=['Log_Returns_Lag2', 'RSI_14', 'MACD', 'ATR_14', 'AR1_Forecast']).reset_index(drop=True)
 
 @app.api_route("/", methods=["GET", "HEAD"])
 def home():
@@ -175,26 +190,18 @@ def home():
 
 @app.get("/api/covered-assets")
 def get_covered_assets():
-    """Returns the list of 59 core institutional companies for export."""
     assets = []
     for sym, data in INSTITUTIONAL_DB.items():
-        dupont = data.get("dupont", {})
-        roe_val = dupont.get("roe", "N/A")
+        roe_val = data.get("dupont", {}).get("roe", "N/A")
         if roe_val != "N/A":
             try:
                 r_num = float(roe_val)
-                if r_num <= 1.0 and r_num > 0:
-                    roe_val = round(r_num * 100, 2)
-            except Exception:
-                pass
+                if r_num <= 1.0 and r_num > 0: roe_val = round(r_num * 100, 2)
+            except: pass
         assets.append({
-            "ticker": sym,
-            "sector": data.get("sector_profile", "N/A"),
-            "market_cap_cr": data.get("market_cap_cr", 0.0),
-            "altman_zone": data.get("altman_z", {}).get("zone", "N/A"),
-            "altman_score": data.get("altman_z", {}).get("score", "N/A"),
-            "roe": roe_val,
-            "piotroski_f": data.get("forensics", {}).get("piotroski_f", {}).get("score", "N/A"),
+            "ticker": sym, "sector": data.get("sector_profile", "N/A"), "market_cap_cr": data.get("market_cap_cr", 0.0),
+            "altman_zone": data.get("altman_z", {}).get("zone", "N/A"), "altman_score": data.get("altman_z", {}).get("score", "N/A"),
+            "roe": roe_val, "piotroski_f": data.get("forensics", {}).get("piotroski_f", {}).get("score", "N/A"),
             "eva_status": data.get("eva", {}).get("status", "N/A")
         })
     return sanitize_json({"count": len(assets), "assets": assets})
@@ -207,10 +214,8 @@ def get_market_overview():
         {"name": "Sensex", "key": "BSE_INDEX|SENSEX"}, 
         {"name": "Nifty IT", "key": "NSE_INDEX|Nifty IT"} 
     ]
-    
     quotes = fetch_live_quote([i["key"] for i in indices])
     overview = []
-    
     for idx in indices:
         df = fetch_upstox_data_dynamic(idx["key"], years=1)
         bar_labels, bar_data = [], []
@@ -225,34 +230,40 @@ def get_market_overview():
         q_data = extract_quote_data(quotes, idx["name"], idx["key"])
         live_price = safe_float(q_data.get('last_price', df['ClosePrice'].iloc[-1] if not df.empty else 0.0))
         change_val = safe_float(q_data.get('net_change', 0.0))
-        
-        overview.append({
-            "name": idx["name"],
-            "price": float(round(live_price, 2)),
-            "change": float(round(change_val, 2)),
-            "bar_labels": bar_labels,
-            "bar_data": bar_data
-        })
-        
+        overview.append({"name": idx["name"], "price": float(round(live_price, 2)), "change": float(round(change_val, 2)), "bar_labels": bar_labels, "bar_data": bar_data})
     return sanitize_json({"overview": overview})
 
 @app.get("/api/search")
 def search_stock(q: str):
     if not q or len(q) < 2: return {"results": []}
+    
+    # NEW: Finnhub Search Routing (If query has no spaces and is short, try US stocks first)
+    results = []
+    if " " not in q and len(q) <= 5:
+        try:
+            fh_url = f"https://finnhub.io/api/v1/search?q={q}&token={FINNHUB_API_KEY}"
+            fh_res = requests.get(fh_url, timeout=3)
+            if fh_res.status_code == 200:
+                fh_data = fh_res.json().get('result', [])
+                for item in fh_data[:3]: # Grab top 3 US matches
+                    if item.get('type') == 'Common Stock' and not '.' in item.get('symbol', ''):
+                        results.append({"ticker": item.get('symbol'), "name": item.get('description'), "instrument_key": f"US_EQ|{item.get('symbol')}"})
+        except: pass
+
+    # Upstox Search (Indian Stocks)
     url = f'https://api.upstox.com/v2/instruments/search?query={urllib.parse.quote(q)}&segments=EQ'
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {UPSTOX_ACCESS_TOKEN}'}
     try:
         res = requests.get(url, headers=headers, timeout=4)
         if res.status_code == 200:
             data = res.json().get('data', [])
-            results = []
             for item in data:
                 if item.get('segment') in ['NSE_EQ', 'BSE_EQ']:
                     results.append({"ticker": item.get('trading_symbol'), "name": item.get('name'), "instrument_key": item.get('instrument_key')})
-            unique_results = {r['ticker']: r for r in results}
-            return {"results": list(unique_results.values())[:8]}
-    except Exception: pass
-    return {"results": []}
+    except: pass
+    
+    unique_results = {r['ticker']: r for r in results}
+    return {"results": list(unique_results.values())[:8]}
 
 @app.get("/api/scanner")
 def get_market_scanner():
@@ -278,26 +289,39 @@ def get_market_scanner():
 @app.get("/api/analyze/{ticker}")
 def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: float = Query(0.0015), neutral_band: float = Query(0.05)):
     ticker = ticker.upper()
-    if not instrument_key: instrument_key = UPSTOX_KEYS.get(ticker)
-    if not instrument_key: raise HTTPException(status_code=400, detail="Instrument Key missing.")
-        
-    raw_data = fetch_upstox_data_dynamic(instrument_key, years=3)
-    if raw_data.empty: raise HTTPException(status_code=400, detail="Data feed timed out.")
-        
-    live_quotes = fetch_live_quote([instrument_key])
-    quote_info = extract_quote_data(live_quotes, ticker, instrument_key)
+    is_us_stock = False
     
-    current_live_price = safe_float(quote_info.get('last_price', raw_data['ClosePrice'].iloc[-1]))
-    current_day_change = safe_float(quote_info.get('net_change', 0.0))
-    current_day_high = safe_float(quote_info.get('ohlc', {}).get('high', raw_data['High'].iloc[-1]))
-    current_day_low = safe_float(quote_info.get('ohlc', {}).get('low', raw_data['Low'].iloc[-1]))
-    current_day_open = safe_float(quote_info.get('ohlc', {}).get('open', current_live_price))
-    current_day_volume = safe_float(quote_info.get('volume', raw_data['Volume'].iloc[-1]))
+    # Check routing direction
+    if instrument_key and instrument_key.startswith("US_EQ|"):
+        is_us_stock = True
+        raw_data = fetch_finnhub_data(ticker, years=3)
+    else:
+        if not instrument_key: instrument_key = UPSTOX_KEYS.get(ticker)
+        if not instrument_key: raise HTTPException(status_code=400, detail="Instrument Key missing.")
+        raw_data = fetch_upstox_data_dynamic(instrument_key, years=3)
+        
+    if raw_data.empty: raise HTTPException(status_code=400, detail="Data feed timed out.")
 
-    today_dt = pd.to_datetime(datetime.now().date())
-    if raw_data['Date'].iloc[-1].date() < today_dt.date():
-        today_row = pd.DataFrame([{'Date': today_dt, 'Open': current_day_open, 'High': max(current_day_high, current_live_price), 'Low': min(current_day_low, current_live_price), 'ClosePrice': current_live_price, 'Volume': current_day_volume}])
-        raw_data = pd.concat([raw_data, today_row], ignore_index=True)
+    if is_us_stock:
+        # For US stocks, calculate daily change manually from the dataframe since Upstox won't have it
+        current_live_price = safe_float(raw_data['ClosePrice'].iloc[-1])
+        prev_close = safe_float(raw_data['ClosePrice'].iloc[-2]) if len(raw_data) > 1 else current_live_price
+        current_day_change = current_live_price - prev_close
+        current_day_high = safe_float(raw_data['High'].iloc[-1])
+        current_day_low = safe_float(raw_data['Low'].iloc[-1])
+    else:
+        live_quotes = fetch_live_quote([instrument_key])
+        quote_info = extract_quote_data(live_quotes, ticker, instrument_key)
+        current_live_price = safe_float(quote_info.get('last_price', raw_data['ClosePrice'].iloc[-1]))
+        current_day_change = safe_float(quote_info.get('net_change', 0.0))
+        current_day_high = safe_float(quote_info.get('ohlc', {}).get('high', raw_data['High'].iloc[-1]))
+        current_day_low = safe_float(quote_info.get('ohlc', {}).get('low', raw_data['Low'].iloc[-1]))
+        current_day_open = safe_float(quote_info.get('ohlc', {}).get('open', current_live_price))
+        current_day_volume = safe_float(quote_info.get('volume', raw_data['Volume'].iloc[-1]))
+        today_dt = pd.to_datetime(datetime.now().date())
+        if raw_data['Date'].iloc[-1].date() < today_dt.date():
+            today_row = pd.DataFrame([{'Date': today_dt, 'Open': current_day_open, 'High': max(current_day_high, current_live_price), 'Low': min(current_day_low, current_live_price), 'ClosePrice': current_live_price, 'Volume': current_day_volume}])
+            raw_data = pd.concat([raw_data, today_row], ignore_index=True)
 
     master_df = generate_hybrid_features(raw_data)
     latest_atr_abs = safe_float(master_df['ATR'].iloc[-1], current_live_price * 0.02)
@@ -342,8 +366,7 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
             "q_upper": float(round(upper_bound[q_day], 2)),
             "q_lower": float(round(lower_bound[q_day], 2))
         }
-    except Exception:
-        pass
+    except: pass
 
     log_vol = np.log(master_df[['Rolling_Vol']] + 1e-8)
     scaled_vol = StandardScaler().fit_transform(log_vol)
@@ -361,8 +384,7 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
         "Random Forest": RandomForestClassifier(n_estimators=60, max_depth=4, min_samples_leaf=8, random_state=42),
         "Logistic Regression": LogisticRegression(C=0.1, max_iter=500, random_state=42)
     }
-    if HAS_CATBOOST:
-        models["CatBoost"] = CatBoostClassifier(depth=3, iterations=60, learning_rate=0.03, l2_leaf_reg=3.0, verbose=0, random_seed=42)
+    if HAS_CATBOOST: models["CatBoost"] = CatBoostClassifier(depth=3, iterations=60, learning_rate=0.03, l2_leaf_reg=3.0, verbose=0, random_seed=42)
     
     results = {name: {'auc': []} for name in models.keys()}
     tscv = TimeSeriesSplit(n_splits=5)
@@ -373,7 +395,7 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
         for name, model in models.items():
             model.fit(X_train_scaled, y_hist.iloc[train_idx])
             try: results[name]['auc'].append(roc_auc_score(y_hist.iloc[test_idx], model.predict_proba(X_test_scaled)[:, 1]))
-            except Exception: results[name]['auc'].append(0.5)
+            except: results[name]['auc'].append(0.5)
 
     best_model_name = max(results, key=lambda k: np.mean(results[k]['auc']))
     
@@ -419,10 +441,11 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
     elif prob_up <= lower_bound: quant_signal = "NEUTRAL (Macro Bull Guard)" if is_macro_bull else "BEARISH"
     else: quant_signal = "NEUTRAL"
 
-    # Gemini News Brief Engine
+    # Gemini News Brief Engine (Use "US" query context for US stocks)
     try:
-        q = urllib.parse.quote(f"{ticker} stock news India")
-        rss_url = f"https://news.google.com/rss/search?q={q}&hl=en-IN&gl=IN&ceid=IN:en"
+        news_query_context = f"{ticker} stock news US" if is_us_stock else f"{ticker} stock news India"
+        q = urllib.parse.quote(news_query_context)
+        rss_url = f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en" if is_us_stock else f"https://news.google.com/rss/search?q={q}&hl=en-IN&gl=IN&ceid=IN:en"
         feed = feedparser.parse(requests.get(rss_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3).content)
         headlines = "\n".join([f"- {h.title}" for h in feed.entries[:10]])
         if headlines.strip():
@@ -445,71 +468,76 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
     recent_candles_df = raw_data.tail(100)
     candle_list = [{"time": str(row['Date'].date()), "open": safe_float(row['Open']), "high": safe_float(row['High']), "low": safe_float(row['Low']), "close": safe_float(row['ClosePrice']), "volume": safe_float(row['Volume'])} for _, row in recent_candles_df.iterrows()]
 
-    # Institutional Fundamental Database Query
+    # Institutional Fundamental Database Query & AI Fallback Logic
     clean_sym = ticker.upper().replace(".NS", "").replace(".BO", "")
     raw_fundamentals = INSTITUTIONAL_DB.get(clean_sym)
     
     if raw_fundamentals:
         fundamentals = dict(raw_fundamentals)
         ui_industry = fundamentals.get("sector_profile", "Database Connected")
-        
-        # DuPont ROE Scaling (Multiplier)
         if "roe" in fundamentals.get("dupont", {}) and fundamentals["dupont"]["roe"] != "N/A":
             try:
                 r_val = float(fundamentals["dupont"]["roe"])
-                if r_val <= 1.0 and r_val > 0:
-                    fundamentals["dupont"]["roe"] = round(r_val * 100, 2)
-            except Exception:
-                pass
-            
-        # Injected descriptive strings
+                if r_val <= 1.0 and r_val > 0: fundamentals["dupont"]["roe"] = round(r_val * 100, 2)
+            except: pass
         if "altman_z" in fundamentals:
             fundamentals["altman_z"]["desc"] = fundamentals["altman_z"].get("desc", "Derived from verified balance sheet filings.")
             fundamentals["altman_z"]["status"] = fundamentals["altman_z"].get("badge", "yellow")
-            
         if "eva" in fundamentals:
-            if fundamentals["eva"].get("status") == "Value Creator":
-                fundamentals["eva"]["verdict"] = f"Generates true economic profit of ₹{fundamentals['eva'].get('eva_cr', 0)} Cr"
-            else:
-                fundamentals["eva"]["verdict"] = f"Destroys economic profit of ₹{fundamentals['eva'].get('eva_cr', 0)} Cr"
-                
+            fundamentals["eva"]["verdict"] = f"Generates true economic profit of ₹{fundamentals['eva'].get('eva_cr', 0)} Cr" if fundamentals["eva"].get("status") == "Value Creator" else f"Destroys economic profit of ₹{fundamentals['eva'].get('eva_cr', 0)} Cr"
         if "forensics" in fundamentals:
-            if "piotroski_f" in fundamentals["forensics"]:
-                fundamentals["forensics"]["piotroski_f"]["desc"] = "Audited year-over-year operational comparison."
-            if "beneish_m" in fundamentals["forensics"]:
-                fundamentals["forensics"]["beneish_m"]["desc"] = "Multi-variable forensic accrual audit."
-        
-        # BFSI EVA Interceptor
+            if "piotroski_f" in fundamentals["forensics"]: fundamentals["forensics"]["piotroski_f"]["desc"] = "Audited year-over-year operational comparison."
+            if "beneish_m" in fundamentals["forensics"]: fundamentals["forensics"]["beneish_m"]["desc"] = "Multi-variable forensic accrual audit."
         if ui_industry == "BFSI":
-            fundamentals["eva"] = {
-                "eva_cr": "N/A",
-                "nopat_cr": "N/A",
-                "wacc_pct": 11.5,
-                "invested_capital_cr": "N/A",
-                "status": "Exempt",
-                "verdict": "EVA calculations structurally exempt for Financial Institutions."
-            }
+            fundamentals["eva"] = {"eva_cr": "N/A", "nopat_cr": "N/A", "wacc_pct": 11.5, "invested_capital_cr": "N/A", "status": "Exempt", "verdict": "EVA calculations structurally exempt for Financial Institutions."}
     else:
-        fundamentals = {
-            "sector_profile": "Database Indexing In Progress",
-            "market_cap_cr": 0.0,
-            "altman_z": {"score": "Queued", "zone": "Ingestion In Progress", "badge": "yellow", "desc": "Company queued in offline extraction pipeline."},
-            "dupont": {"roe": 0.0, "profit_margin": 0.0, "asset_turnover": 0.0, "financial_leverage": 0.0, "verdict": "Pipeline Queued"},
-            "eva": {"eva_cr": 0.0, "nopat_cr": 0.0, "wacc_pct": 0.0, "invested_capital_cr": 0.0, "status": "Pending", "verdict": "Pipeline Queued"},
-            "forensics": {
-                "piotroski_f": {"score": 0, "status": "Pending", "badge": "yellow", "desc": "Queued in background pipeline."},
-                "beneish_m": {"score": "N/A", "verdict": "Pending", "badge": "yellow", "desc": "Queued in background pipeline."}
+        # =================================================================
+        # NEW: GEMINI AI FUNDAMENTAL FALLBACK ESTIMATOR (For Missing/US Stocks)
+        # =================================================================
+        try:
+            client = genai.Client(api_key=GEMINI_API_KEY)
+            prompt = f"""Estimate the current financial health for the public company '{ticker}'. Return strictly in JSON format with no markdown wrappers:
+            {{"sector": "<General Sector e.g., TECHNOLOGY, CONSUMER, FINANCE>", "altman_score": <float estimate 0-10>, "altman_zone": "<Safe/Grey/Distress>", "roe_estimate": <float percentage estimate>, "piotroski_score": <int 1-9>}}"""
+            
+            interaction = client.interactions.create(model='gemini-3.8-flash', input=prompt)
+            raw_text = interaction.output_text.strip()
+            match = re.search(r'\{.*\}', raw_text, re.DOTALL)
+            ai_fund_json = json.loads(match.group(0)) if match else {}
+            
+            ai_sector = ai_fund_json.get("sector", "GLOBAL_EQUITY")
+            ai_z_score = safe_float(ai_fund_json.get("altman_score", 2.5))
+            ai_z_zone = str(ai_fund_json.get("altman_zone", "Grey Zone"))
+            ai_roe = safe_float(ai_fund_json.get("roe_estimate", 15.0))
+            ai_f_score = int(ai_fund_json.get("piotroski_score", 5))
+            
+            fundamentals = {
+                "sector_profile": f"AI Fallback Estimate ({ai_sector})",
+                "market_cap_cr": "N/A",
+                "altman_z": {"score": ai_z_score, "zone": ai_z_zone, "badge": "yellow" if "Grey" in ai_z_zone else "green", "desc": "Estimated via Gemini Catalyst Engine."},
+                "dupont": {"roe": ai_roe, "profit_margin": "N/A", "asset_turnover": "N/A", "financial_leverage": "N/A", "verdict": "AI Heuristic Estimate"},
+                "eva": {"eva_cr": "N/A", "nopat_cr": "N/A", "wacc_pct": 10.0, "invested_capital_cr": "N/A", "status": "Pending", "verdict": "Requires verified 10-K filings."},
+                "forensics": {
+                    "piotroski_f": {"score": ai_f_score, "status": "Estimated", "badge": "yellow", "desc": "Estimated via NLP consensus."},
+                    "beneish_m": {"score": "N/A", "verdict": "Pending", "badge": "yellow", "desc": "Requires verified SEC/BSE filings."}
+                }
             }
-        }
-        ui_industry = "Database Ingestion Queued"
+            ui_industry = f"AI Recovery: {ai_sector}"
+        except Exception:
+            fundamentals = {
+                "sector_profile": "Data Unavailable",
+                "market_cap_cr": 0.0,
+                "altman_z": {"score": "N/A", "zone": "Data Missing", "badge": "red", "desc": "Could not extract or estimate."},
+                "dupont": {"roe": 0.0, "profit_margin": 0.0, "asset_turnover": 0.0, "financial_leverage": 0.0, "verdict": "Missing Data"},
+                "eva": {"eva_cr": 0.0, "nopat_cr": 0.0, "wacc_pct": 0.0, "invested_capital_cr": 0.0, "status": "Error", "verdict": "Missing Data"},
+                "forensics": {
+                    "piotroski_f": {"score": 0, "status": "Error", "badge": "red", "desc": "Missing Data"},
+                    "beneish_m": {"score": "N/A", "verdict": "Error", "badge": "red", "desc": "Missing Data"}
+                }
+            }
+            ui_industry = "Data Missing"
 
-    # =================================================================
-    # TOP 5 SECTOR PEERS MATCHER
-    # =================================================================
     peers_list = []
     target_sector = fundamentals.get("sector_profile", "")
-    
-    # Priority 1: Match by identical sector profile
     for p_sym, p_data in INSTITUTIONAL_DB.items():
         if p_sym != clean_sym and p_data.get("sector_profile") == target_sector:
             p_roe = p_data.get("dupont", {}).get("roe", "N/A")
@@ -517,20 +545,10 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
                 try:
                     r_f = float(p_roe)
                     if r_f <= 1.0 and r_f > 0: p_roe = round(r_f * 100, 2)
-                except Exception: pass
-            peers_list.append({
-                "ticker": p_sym,
-                "sector": p_data.get("sector_profile", "N/A"),
-                "market_cap_cr": p_data.get("market_cap_cr", 0.0),
-                "roe": p_roe,
-                "altman_score": p_data.get("altman_z", {}).get("score", "N/A"),
-                "zone": p_data.get("altman_z", {}).get("zone", "N/A"),
-                "badge": p_data.get("altman_z", {}).get("badge", "green" if "Safe" in p_data.get("altman_z", {}).get("zone", "") else "yellow")
-            })
-            if len(peers_list) >= 5:
-                break
-                
-    # Priority 2: Fallback fill to always guarantee 5 liquid competitors
+                except: pass
+            peers_list.append({"ticker": p_sym, "sector": p_data.get("sector_profile", "N/A"), "market_cap_cr": p_data.get("market_cap_cr", 0.0), "roe": p_roe, "altman_score": p_data.get("altman_z", {}).get("score", "N/A"), "zone": p_data.get("altman_z", {}).get("zone", "N/A"), "badge": p_data.get("altman_z", {}).get("badge", "green" if "Safe" in p_data.get("altman_z", {}).get("zone", "") else "yellow")})
+            if len(peers_list) >= 5: break
+            
     if len(peers_list) < 5:
         for p_sym, p_data in INSTITUTIONAL_DB.items():
             if p_sym != clean_sym and p_sym not in [x["ticker"] for x in peers_list]:
@@ -539,21 +557,13 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
                     try:
                         r_f = float(p_roe)
                         if r_f <= 1.0 and r_f > 0: p_roe = round(r_f * 100, 2)
-                    except Exception: pass
-                peers_list.append({
-                    "ticker": p_sym,
-                    "sector": p_data.get("sector_profile", "N/A"),
-                    "market_cap_cr": p_data.get("market_cap_cr", 0.0),
-                    "roe": p_roe,
-                    "altman_score": p_data.get("altman_z", {}).get("score", "N/A"),
-                    "zone": p_data.get("altman_z", {}).get("zone", "N/A"),
-                    "badge": p_data.get("altman_z", {}).get("badge", "yellow")
-                })
-                if len(peers_list) >= 5:
-                    break
+                    except: pass
+                peers_list.append({"ticker": p_sym, "sector": p_data.get("sector_profile", "N/A"), "market_cap_cr": p_data.get("market_cap_cr", 0.0), "roe": p_roe, "altman_score": p_data.get("altman_z", {}).get("score", "N/A"), "zone": p_data.get("altman_z", {}).get("zone", "N/A"), "badge": p_data.get("altman_z", {}).get("badge", "yellow")})
+                if len(peers_list) >= 5: break
 
     response_payload = {
         "ticker": str(ticker),
+        "is_us_stock": is_us_stock, # Flag sent to frontend for currency formatting
         "live_price": float(round(current_live_price, 2)),
         "day_change_val": float(round(current_day_change, 2)),
         "day_high": float(round(current_day_high, 2)),
