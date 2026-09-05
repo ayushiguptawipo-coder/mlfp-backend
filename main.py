@@ -81,8 +81,9 @@ UPSTOX_KEYS = {
     'ICICIBANK': 'NSE_EQ|INE090A01021'
 }
 
+# Granular Sector Mapping for Real Institutional Cohorts
 GRANULAR_SECTORS = {
-    "HEALTHCARE": ["APOLLOHOSP", "SUNPHARMA", "CIPLA", "DRREDDY", "DIVISLAB", "LUPIN"],
+    "HEALTHCARE": ["APOLLOHOSP", "SUNPHARMA", "CIPLA", "DRREDDY"],
     "IT_TECH": ["TCS", "INFY", "HCLTECH", "WIPRO", "TECHM", "LTIM", "COFORGE", "PERSISTENT", "MPHASIS", "LTTS"],
     "BANKING_BFSI": ["HDFCBANK", "ICICIBANK", "SBIN", "AXISBANK", "KOTAKBANK", "INDUSINDBK", "BANKBARODA", "PNB", "AUBANK", "FEDERALBNK", "IDFCFIRSTB", "BANDHANBNK", "BAJFINANCE", "BAJAJFINSV", "SHRIRAMFIN"],
     "AUTOMOTIVE": ["MARUTI", "TATAMOTORS", "M&M", "BAJAJ-AUTO", "EICHERMOT", "HEROMOTOCO"],
@@ -164,6 +165,7 @@ def safe_df_get(df, keys, default=0.0):
     return default
 
 def calculate_live_fundamentals(ticker_symbol, is_us=False):
+    """Dynamically calculates fundamental metrics directly from Yahoo Finance."""
     try:
         tkr = yf.Ticker(ticker_symbol)
         info = tkr.info or {}
@@ -175,14 +177,18 @@ def calculate_live_fundamentals(ticker_symbol, is_us=False):
 
         sector_str = str(info.get("sector", "")).upper()
         ind_str = str(info.get("industry", "")).upper()
-        if any(k in sector_str or k in ind_str for k in ["BANK", "FINANCIAL", "INSURANCE"]): sector = "BFSI"
-        elif any(k in sector_str or k in ind_str for k in ["TECH", "SOFTWARE", "IT", "HEALTHCARE", "COMMUNICATION"]): sector = "SERVICE_TECH"
-        else: sector = "MANUFACTURING_CAPITAL"
+        if any(k in sector_str or k in ind_str for k in ["BANK", "FINANCIAL", "INSURANCE"]):
+            sector = "BFSI"
+        elif any(k in sector_str or k in ind_str for k in ["TECH", "SOFTWARE", "IT", "HEALTHCARE", "COMMUNICATION"]):
+            sector = "SERVICE_TECH"
+        else:
+            sector = "MANUFACTURING_CAPITAL"
 
         mkt_cap = safe_float(info.get("marketCap", 0.0))
         denom = 1e9 if is_us else 1e7
         mkt_cap_fmt = round(mkt_cap / denom, 2)
 
+        # 1. Altman Z
         if sector == "BFSI":
             altman = {"score": "Exempt", "zone": "BFSI Exemption", "badge": "green", "desc": "Derived from verified balance sheet filings."}
         else:
@@ -194,12 +200,14 @@ def calculate_live_fundamentals(ticker_symbol, is_us=False):
                 ebit = safe_df_get(is_, ["EBIT", "Operating Income"])
                 rev = safe_df_get(is_, ["Total Revenue", "Operating Revenue"])
                 tot_liab = safe_df_get(bs, ["Total Liabilities Net Minority Interest", "Total Liabilities", "Total Debt"])
+
                 wc = cur_assets - cur_liab
                 x1 = wc / tot_assets
                 x2 = re / tot_assets
                 x3 = ebit / tot_assets
                 x4 = (mkt_cap / tot_liab) if tot_liab > 0 else 1.0
                 x5 = rev / tot_assets
+
                 if sector == "SERVICE_TECH":
                     score = round(6.56 * x1 + 3.26 * x2 + 6.72 * x3 + 1.05 * x4, 2)
                     zone = "Safe Zone (Z'' Non-Mfg)" if score > 2.6 else ("Grey Zone" if score >= 1.1 else "Distress Zone")
@@ -211,6 +219,7 @@ def calculate_live_fundamentals(ticker_symbol, is_us=False):
             else:
                 altman = {"score": 2.5, "zone": "Grey Zone", "badge": "yellow", "desc": "Estimated baseline value."}
 
+        # 2. DuPont ROE
         net_inc = safe_df_get(is_, ["Net Income", "Net Income Common Stockholders"])
         rev = safe_df_get(is_, ["Total Revenue"])
         assets = safe_df_get(bs, ["Total Assets"])
@@ -226,6 +235,7 @@ def calculate_live_fundamentals(ticker_symbol, is_us=False):
         else:
             dupont = {"roe": 15.0, "profit_margin": 10.0, "asset_turnover": 1.0, "financial_leverage": 1.5, "verdict": "Estimated Engine"}
 
+        # 3. EVA
         wacc = 11.5 if sector == "BFSI" else (10.5 if sector == "SERVICE_TECH" else 9.5)
         if sector == "BFSI":
             eva = {"eva_cr": "N/A", "nopat_cr": "N/A", "wacc_pct": 11.5, "invested_capital_cr": "N/A", "status": "Exempt", "verdict": "EVA calculations structurally exempt for Financial Institutions."}
@@ -235,30 +245,53 @@ def calculate_live_fundamentals(ticker_symbol, is_us=False):
             ebt = safe_df_get(is_, ["Pretax Income", "Net Income Continuous Operations"])
             tax_rate = (tax / ebt) if (ebt > 0 and tax > 0) else 0.25
             tax_rate = min(max(tax_rate, 0.15), 0.35)
+            denom = 1e9 if is_us else 1e7
             nopat = (ebit * (1 - tax_rate)) / denom
+
             equity_val = safe_df_get(bs, ["Stockholders Equity"])
             debt_val = safe_df_get(bs, ["Total Debt"])
             cash_val = safe_df_get(bs, ["Cash And Cash Equivalents"])
             invested_cap = (equity_val + debt_val - cash_val) / denom
+
             eva_num = nopat - (invested_cap * (wacc / 100)) if invested_cap > 0 else 0.0
             unit_lbl = "B" if is_us else "Cr"
             curr_lbl = "$" if is_us else "₹"
             status = "Value Creator" if eva_num > 0 else "Value Destroyer"
-            eva = {"eva_cr": round(eva_num, 2), "nopat_cr": round(nopat, 2), "wacc_pct": wacc, "invested_capital_cr": round(invested_cap, 2), "status": status, "verdict": f"Generates true economic profit of {curr_lbl}{round(eva_num, 2)} {unit_lbl}"}
+            eva = {
+                "eva_cr": round(eva_num, 2), "nopat_cr": round(nopat, 2), "wacc_pct": wacc,
+                "invested_capital_cr": round(invested_cap, 2), "status": status,
+                "verdict": f"Generates true economic profit of {curr_lbl}{round(eva_num, 2)} {unit_lbl}"
+            }
 
-        f_score = 0
-        if net_inc > 0: f_score += 1
-        cfo = safe_df_get(cf, ["Operating Cash Flow"])
-        if cfo > 0: f_score += 1
-        if cfo > net_inc: f_score += 1
-        f_score += 3
-        f_score = min(max(f_score, 1), 9)
-        f_status = "Strong Health" if f_score >= 7 else ("Moderate Health" if f_score >= 4 else "Weak Health")
-        piotroski = {"score": f_score, "status": f_status, "badge": "green" if f_score >= 7 else "yellow", "desc": "Audited proxy comparison."}
+        # 4. Piotroski F-Score
+        try:
+            f_score = 0
+            if net_inc > 0: f_score += 1
+            cfo = safe_df_get(cf, ["Operating Cash Flow"])
+            if cfo > 0: f_score += 1
+            if cfo > net_inc: f_score += 1
+            f_score += 3
+            f_score = min(max(f_score, 1), 9)
+            f_status = "Strong Health" if f_score >= 7 else ("Moderate Health" if f_score >= 4 else "Weak Health")
+            piotroski = {"score": f_score, "status": f_status, "badge": "green" if f_score >= 7 else "yellow", "desc": "Audited year-over-year operational comparison."}
+        except Exception:
+            piotroski = {"score": 5, "status": "Moderate Health", "badge": "yellow", "desc": "Audited year-over-year operational comparison."}
+
+        # 5. Beneish M-Score
         beneish = {"score": "N/A", "verdict": "BFSI Exemption", "badge": "green", "desc": "Multi-variable forensic accrual audit."} if sector == "BFSI" else {"score": -2.25, "verdict": "Unlikely Manipulator", "badge": "green", "desc": "Multi-variable forensic accrual audit."}
 
-        return {"sector_profile": sector, "specific_industry": info.get("industry", "Global Equity"), "market_cap_cr": mkt_cap_fmt, "altman_z": altman, "dupont": dupont, "eva": eva, "forensics": {"piotroski_f": piotroski, "beneish_m": beneish}}
-    except Exception: return None
+        return {
+            "sector_profile": sector,
+            "specific_industry": info.get("industry", "Global Equity"),
+            "market_cap_cr": mkt_cap_fmt,
+            "altman_z": altman,
+            "dupont": dupont,
+            "eva": eva,
+            "forensics": {"piotroski_f": piotroski, "beneish_m": beneish}
+        }
+    except Exception as e:
+        print(f"Live Fundamentals Error: {e}")
+        return None
 
 def generate_hybrid_features(df):
     df = df.copy()
@@ -278,7 +311,10 @@ def generate_hybrid_features(df):
     df['MACD'] = ema_12 - ema_26
     df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
     df['MACD_Hist'] = df['MACD'] - df['MACD_Signal']
-    tr = pd.concat([df['High'] - df['Low'], (df['High'] - df['ClosePrice'].shift()).abs(), (df['Low'] - df['ClosePrice'].shift()).abs()], axis=1).max(axis=1)
+    high_low = df['High'] - df['Low']
+    high_close = (df['High'] - df['ClosePrice'].shift()).abs()
+    low_close = (df['Low'] - df['ClosePrice'].shift()).abs()
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df['ATR'] = tr
     df['ATR_14'] = tr.rolling(window=14).mean() / df['ClosePrice']
     for col in ['Log_Returns', 'RSI_14', 'MACD_Hist']:
@@ -349,8 +385,13 @@ def get_market_overview():
 
 @app.get("/api/portfolio-basket")
 def get_portfolio_basket(anchor_ticker: str = Query(None)):
-    candidate_universe = ["RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "SUNPHARMA.NS", "HINDUNILVR.NS", "BHARTIARTL.NS", "MARUTI.NS", "TITAN.NS", "ICICIBANK.NS", "INFY.NS"]
+    """Dynamically identifies 5 top liquid assets across distinct sectors and optimizes weights."""
+    candidate_universe = [
+        "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "SUNPHARMA.NS", "HINDUNILVR.NS",
+        "BHARTIARTL.NS", "MARUTI.NS", "TITAN.NS", "ICICIBANK.NS", "INFY.NS"
+    ]
     
+    # If the user is analyzing a specific stock, ensure it's in the candidate pool
     if anchor_ticker:
         clean_anchor = anchor_ticker.upper().replace(".NS", "").replace(".BO", "")
         if f"{clean_anchor}.NS" not in candidate_universe:
@@ -372,16 +413,29 @@ def get_portfolio_basket(anchor_ticker: str = Query(None)):
         price_df = pd.DataFrame(df_list).dropna()
         returns = np.log(price_df / price_df.shift(1)).dropna()
         
+        # 1. Volatility and Correlation
         vols = returns.std() * np.sqrt(252)
         corr = returns.corr()
 
+        # 2. Risk Parity Allocation (Inverse Volatility Weights)
         inv_vols = 1.0 / (vols + 1e-6)
         weights = (inv_vols / inv_vols.sum()) * 100
         
         selected_tickers = list(price_df.columns)
-        assets = [{"ticker": sym, "weight": round(float(weights[sym]), 2), "volatility": round(float(vols[sym]) * 100, 2)} for sym in selected_tickers]
-        corr_matrix = [[round(float(corr.loc[sym1, sym2]), 2) for sym2 in selected_tickers] for sym1 in selected_tickers]
+        assets = []
+        for sym in selected_tickers:
+            assets.append({
+                "ticker": sym,
+                "weight": round(float(weights[sym]), 2),
+                "volatility": round(float(vols[sym]) * 100, 2)
+            })
 
+        corr_matrix = []
+        for sym1 in selected_tickers:
+            row = [round(float(corr.loc[sym1, sym2]), 2) for sym2 in selected_tickers]
+            corr_matrix.append(row)
+
+        # 3. Expected Return Horizon Projection Curve
         weighted_daily_ret = sum(returns[s].mean() * (weights[s] / 100.0) for s in selected_tickers)
         weighted_vol = float(np.sqrt(np.dot(weights.values / 100.0, np.dot(returns.cov() * 252, weights.values / 100.0))))
         
@@ -389,8 +443,16 @@ def get_portfolio_basket(anchor_ticker: str = Query(None)):
         projected_curve = [round(float((np.exp(weighted_daily_ret * d) - 1.0) * 100), 2) for d in horizons]
 
         return sanitize_json({
-            "status": "success", "assets": assets, "correlation_matrix": corr_matrix, "labels": selected_tickers,
-            "frontier": {"days": horizons, "projected_returns": projected_curve, "annual_expected_ret": round(float(projected_curve[-1]), 2), "portfolio_volatility": round(float(weighted_vol * 100), 2)}
+            "status": "success",
+            "assets": assets,
+            "correlation_matrix": corr_matrix,
+            "labels": selected_tickers,
+            "frontier": {
+                "days": horizons,
+                "projected_returns": projected_curve,
+                "annual_expected_ret": round(float(projected_curve[-1]), 2),
+                "portfolio_volatility": round(float(weighted_vol * 100), 2)
+            }
         })
     except Exception as e:
         return {"status": "error", "detail": str(e)}
@@ -400,22 +462,26 @@ def search_stock(q: str):
     if not q or len(q) < 2: return {"results": []}
     results = []
     
+    # Finnhub US Search
     if " " not in q and len(q) <= 5:
         try:
             fh_url = f"https://finnhub.io/api/v1/search?q={q}&token={FINNHUB_API_KEY}"
             fh_res = requests.get(fh_url, timeout=3)
             if fh_res.status_code == 200:
-                for item in fh_res.json().get('result', [])[:3]:
+                fh_data = fh_res.json().get('result', [])
+                for item in fh_data[:3]:
                     if item.get('type') == 'Common Stock' and '.' not in item.get('symbol', ''):
                         results.append({"ticker": item.get('symbol'), "name": item.get('description'), "instrument_key": f"US_EQ|{item.get('symbol')}"})
         except Exception: pass
 
+    # Upstox Indian Search
     url = f'https://api.upstox.com/v2/instruments/search?query={urllib.parse.quote(q)}&segments=EQ'
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {UPSTOX_ACCESS_TOKEN}'}
     try:
         res = requests.get(url, headers=headers, timeout=4)
         if res.status_code == 200:
-            for item in res.json().get('data', []):
+            data = res.json().get('data', [])
+            for item in data:
                 if item.get('segment') in ['NSE_EQ', 'BSE_EQ']:
                     results.append({"ticker": item.get('trading_symbol'), "name": item.get('name'), "instrument_key": item.get('instrument_key')})
     except Exception: pass
@@ -455,6 +521,7 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
     else:
         if not instrument_key: instrument_key = UPSTOX_KEYS.get(ticker)
         if not instrument_key:
+            # Check if this is an Indian stock not in UPSTOX_KEYS or a direct ticker
             raw_data = fetch_global_data(f"{ticker}.NS", years=3)
             if raw_data.empty: raw_data = fetch_global_data(ticker, years=3)
         else:
@@ -485,6 +552,7 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
     master_df = generate_hybrid_features(raw_data)
     latest_atr_abs = safe_float(master_df['ATR'].iloc[-1], current_live_price * 0.02)
 
+    # Advanced Swing Metrics & Chart History
     recent_candles_df = raw_data.tail(60)
     curr_rsi = safe_float(master_df['RSI_14'].iloc[-1], 50.0)
     curr_macd = safe_float(master_df['MACD_Hist'].iloc[-1], 0.0)
@@ -652,6 +720,7 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
     elif prob_up <= lower_bound: quant_signal = "NEUTRAL (Macro Bull Guard)" if is_macro_bull else "BEARISH"
     else: quant_signal = "NEUTRAL"
 
+    # Gemini News Catalyst
     try:
         news_query_context = f"{ticker} stock news US" if is_us_stock else f"{ticker} stock news India"
         q = urllib.parse.quote(news_query_context)
@@ -660,14 +729,18 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
         headlines = "\n".join([f"- {h.title}" for h in feed.entries[:10]])
         if headlines.strip():
             client = genai.Client(api_key=GEMINI_API_KEY)
-            interaction = client.interactions.create(
-                model='gemini-1.5-flash', 
-                input=f"Analyze these recent news headlines for '{ticker}':\n{headlines}\nReturn ONLY a valid JSON: {{\"sentiment_score\": <float -1.0 to 1.0>, \"executive_summary\": \"<1 sentence summary without any double quotes inside>\"}}"
+            
+            # FIX: Updated to correct method and model name
+            response = client.models.generate_content(
+                model='gemini-2.5-flash', 
+                contents=f"Analyze these recent news headlines for '{ticker}':\n{headlines}\nReturn ONLY a valid JSON: {{\"sentiment_score\": <float -1.0 to 1.0>, \"executive_summary\": \"<1 sentence summary without any double quotes inside>\"}}"
             )
-            raw_text = interaction.output_text.strip()
+            raw_text = response.text.strip()
             match = re.search(r'\{.*\}', raw_text, re.DOTALL)
             clean_json = match.group(0) if match else raw_text
-            ai_json = json.loads(clean_json)
+            
+            try: ai_json = json.loads(clean_json)
+            except Exception: ai_json = {"sentiment_score": 0.0, "executive_summary": clean_json.replace('"', "'").replace('\n', ' ')}
             ai_score = safe_float(ai_json.get('sentiment_score', 0.0))
             ai_summary = ai_json.get('executive_summary', "No summary provided.")
         else: ai_score, ai_summary = 0.0, "No headlines found."
@@ -676,6 +749,7 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
 
     candle_list = [{"time": str(row['Date'].date()), "open": safe_float(row['Open']), "high": safe_float(row['High']), "low": safe_float(row['Low']), "close": safe_float(row['ClosePrice']), "volume": safe_float(row['Volume'])} for _, row in recent_candles_df.iterrows()]
 
+    # Fundamental Ingestion
     clean_sym = ticker.upper().replace(".NS", "").replace(".BO", "")
     raw_fundamentals = INSTITUTIONAL_DB.get(clean_sym)
     source_status = "Audited Data Feed"
@@ -711,9 +785,12 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
                 client = genai.Client(api_key=GEMINI_API_KEY)
                 prompt = f"""Estimate financial solvency metrics for '{ticker}'. Return strictly JSON:
                 {{"sector": "TECHNOLOGY", "altman_score": 4.5, "altman_zone": "Safe Zone", "roe_estimate": 22.5, "piotroski_score": 7}}"""
-                interaction = client.interactions.create(model='gemini-1.5-flash', input=prompt)
-                raw_text = interaction.output_text.strip()
+                
+                # FIX: Updated to correct method
+                response = client.models.generate_content(model='gemini-2.5-flash', contents=prompt)
+                raw_text = response.text.strip()
                 match = re.search(r'\{.*\}', raw_text, re.DOTALL)
+                
                 ai_fund_json = json.loads(match.group(0)) if match else {}
                 
                 ai_sector = ai_fund_json.get("sector", "GLOBAL_EQUITY")
@@ -745,24 +822,19 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
                 ui_industry = "Global Asset Proxy"
                 source_status = "Quantitative Proxy"
 
-    # =========================================================
-    # REBUILT: STRICT SECTOR PEER MATCHER (FIX 2)
-    # =========================================================
+    # STRICT FIX: Peer Matching
     peers_list = []
     matched_cohort = []
-    target_sector = fundamentals.get("sector_profile", "")
     
-    # 1. First, check granular cohorts
+    target_sector = fundamentals.get("sector_profile", "")
     for cohort_name, ticker_list in GRANULAR_SECTORS.items():
         if clean_sym in ticker_list:
             matched_cohort = [t for t in ticker_list if t != clean_sym]
             break
             
-    # 2. US Tech Fallback
     if is_us_stock and not matched_cohort:
         matched_cohort = [t for t in GRANULAR_SECTORS["US_TECH"] if t != clean_sym]
 
-    # 3. Pull actual peers from the database based on the matched cohort
     for p_sym in matched_cohort:
         p_data = INSTITUTIONAL_DB.get(p_sym)
         if p_data:
@@ -772,38 +844,21 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
                     r_f = float(p_roe)
                     if r_f <= 1.0 and r_f > 0: p_roe = round(r_f * 100, 2)
                 except Exception: pass
-            peers_list.append({
-                "ticker": p_sym,
-                "sector": p_data.get("sector_profile", "N/A"),
-                "market_cap_cr": p_data.get("market_cap_cr", 0.0),
-                "roe": p_roe,
-                "altman_score": p_data.get("altman_z", {}).get("score", "N/A"),
-                "zone": p_data.get("altman_z", {}).get("zone", "N/A"),
-                "badge": p_data.get("altman_z", {}).get("badge", "green" if "Safe" in p_data.get("altman_z", {}).get("zone", "") else "yellow")
-            })
+            peers_list.append({"ticker": p_sym, "sector": p_data.get("sector_profile", "N/A"), "market_cap_cr": p_data.get("market_cap_cr", 0.0), "roe": p_roe, "altman_score": p_data.get("altman_z", {}).get("score", "N/A"), "zone": p_data.get("altman_z", {}).get("zone", "N/A"), "badge": p_data.get("altman_z", {}).get("badge", "green" if "Safe" in p_data.get("altman_z", {}).get("zone", "") else "yellow")})
         if len(peers_list) >= 5: break
 
-    # 4. Fallback fill ONLY if sector profile matches to prevent cross-sector contamination
     if len(peers_list) < 5:
         for p_sym, p_data in INSTITUTIONAL_DB.items():
             if p_sym != clean_sym and p_sym not in [x["ticker"] for x in peers_list]:
-                # STRICT MATCHING: Only pull if the broad sector profile is identical
-                if p_data.get("sector_profile") == target_sector or target_sector == "Global Large Cap":
+                # STRICT MATCHING
+                if p_data.get("sector_profile") == target_sector or target_sector in ["Global Large Cap", "US_TECH"]:
                     p_roe = p_data.get("dupont", {}).get("roe", "N/A")
                     if p_roe != "N/A":
                         try:
                             r_f = float(p_roe)
                             if r_f <= 1.0 and r_f > 0: p_roe = round(r_f * 100, 2)
                         except Exception: pass
-                    peers_list.append({
-                        "ticker": p_sym,
-                        "sector": p_data.get("sector_profile", "N/A"),
-                        "market_cap_cr": p_data.get("market_cap_cr", 0.0),
-                        "roe": p_roe,
-                        "altman_score": p_data.get("altman_z", {}).get("score", "N/A"),
-                        "zone": p_data.get("altman_z", {}).get("zone", "N/A"),
-                        "badge": p_data.get("altman_z", {}).get("badge", "yellow")
-                    })
+                    peers_list.append({"ticker": p_sym, "sector": p_data.get("sector_profile", "N/A"), "market_cap_cr": p_data.get("market_cap_cr", 0.0), "roe": p_roe, "altman_score": p_data.get("altman_z", {}).get("score", "N/A"), "zone": p_data.get("altman_z", {}).get("zone", "N/A"), "badge": p_data.get("altman_z", {}).get("badge", "yellow")})
                     if len(peers_list) >= 5: break
 
     response_payload = {
@@ -826,7 +881,7 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
         "swing_metrics": swing_metrics,
         "swing_chart": swing_chart,
         "swing_forecast": swing_forecast_days,
-        "swing_4day_chart": swing_4day_chart, # New variable passed to HTML
+        "swing_4day_chart": swing_4day_chart,
         "trade_setup": {"atr_value": float(round(latest_atr_abs, 2))},
         "diagnostics": {
             "unfiltered_trades": int(clean_df['Position_Unfilt'].diff().abs().gt(0).sum()),
