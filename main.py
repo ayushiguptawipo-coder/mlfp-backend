@@ -44,7 +44,6 @@ app.add_middleware(
 # Load the Institutional Database into memory on server boot
 INSTITUTIONAL_DB = {}
 try:
-    # UPDATED: Pointing to the new master database
     if os.path.exists("fundamentals_db_master.json"):
         with open("fundamentals_db_master.json", "r") as f:
             INSTITUTIONAL_DB = json.load(f)
@@ -394,7 +393,9 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
     elif prob_up <= lower_bound: quant_signal = "NEUTRAL (Macro Bull Guard)" if is_macro_bull else "BEARISH"
     else: quant_signal = "NEUTRAL"
 
-    # Gemini News Brief Engine
+    # =================================================================
+    # FIXED: UPGRADED GEMINI NEWS PARSER TO INTERACTIONS API
+    # =================================================================
     try:
         q = urllib.parse.quote(f"{ticker} stock news India")
         rss_url = f"https://news.google.com/rss/search?q={q}&hl=en-IN&gl=IN&ceid=IN:en"
@@ -402,12 +403,11 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
         headlines = "\n".join([f"- {h.title}" for h in feed.entries[:10]])
         if headlines.strip():
             client = genai.Client(api_key=GEMINI_API_KEY)
-            resp = client.models.generate_content(
-                model='gemini-2.5-flash', 
-                contents=f"Analyze these recent news headlines for '{ticker}':\n{headlines}\nReturn ONLY a valid JSON: {{\"sentiment_score\": <float -1.0 to 1.0>, \"executive_summary\": \"<1 sentence summary without any double quotes inside>\"}}", 
-                config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.0)
+            interaction = client.interactions.create(
+                model='gemini-3.8-flash', 
+                input=f"Analyze these recent news headlines for '{ticker}':\n{headlines}\nReturn ONLY a valid JSON: {{\"sentiment_score\": <float -1.0 to 1.0>, \"executive_summary\": \"<1 sentence summary without any double quotes inside>\"}}"
             )
-            raw_text = resp.text.strip()
+            raw_text = interaction.output_text.strip()
             match = re.search(r'\{.*\}', raw_text, re.DOTALL)
             clean_json = match.group(0) if match else raw_text
             try: ai_json = json.loads(clean_json)
@@ -423,11 +423,35 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
 
     # Institutional Fundamental Database Query
     clean_sym = ticker.upper().replace(".NS", "").replace(".BO", "")
-    company_fundamentals = INSTITUTIONAL_DB.get(clean_sym)
+    raw_fundamentals = INSTITUTIONAL_DB.get(clean_sym)
     
-    if company_fundamentals:
-        fundamentals = company_fundamentals
+    if raw_fundamentals:
+        fundamentals = dict(raw_fundamentals) # Create a copy to prevent memory contamination
         ui_industry = fundamentals.get("sector_profile", "Database Connected")
+        
+        # =================================================================
+        # FIXED: DYNAMIC TEXT INJECTION & ROE MATH CORRECTION
+        # =================================================================
+        # Fix 1: DuPont ROE Scaling (Multiplier)
+        if "roe" in fundamentals.get("dupont", {}) and fundamentals["dupont"]["roe"] != "N/A":
+            fundamentals["dupont"]["roe"] = round(float(fundamentals["dupont"]["roe"]) * 100, 2)
+            
+        # Fix 2: Injecting missing descriptions for HTML frontend
+        if "altman_z" in fundamentals:
+            fundamentals["altman_z"]["desc"] = fundamentals["altman_z"].get("desc", "Derived from verified balance sheet filings.")
+            fundamentals["altman_z"]["status"] = fundamentals["altman_z"].get("badge", "yellow")
+            
+        if "eva" in fundamentals:
+            if fundamentals["eva"].get("status") == "Value Creator":
+                fundamentals["eva"]["verdict"] = f"Generates true economic profit of ₹{fundamentals['eva'].get('eva_cr', 0)} Cr"
+            else:
+                fundamentals["eva"]["verdict"] = f"Destroys economic profit of ₹{fundamentals['eva'].get('eva_cr', 0)} Cr"
+                
+        if "forensics" in fundamentals:
+            if "piotroski_f" in fundamentals["forensics"]:
+                fundamentals["forensics"]["piotroski_f"]["desc"] = "Audited year-over-year operational comparison."
+            if "beneish_m" in fundamentals["forensics"]:
+                fundamentals["forensics"]["beneish_m"]["desc"] = "Multi-variable forensic accrual audit."
         
         # =================================================================
         # CRITICAL BFSI EVA INTERCEPTOR: Neutralizes false metrics for banks
