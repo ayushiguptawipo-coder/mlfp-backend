@@ -173,6 +173,32 @@ def generate_hybrid_features(df):
 def home():
     return {"status": "MLFP Quant Engine Pro API is online."}
 
+@app.get("/api/covered-assets")
+def get_covered_assets():
+    """Returns the list of 59 core institutional companies for export."""
+    assets = []
+    for sym, data in INSTITUTIONAL_DB.items():
+        dupont = data.get("dupont", {})
+        roe_val = dupont.get("roe", "N/A")
+        if roe_val != "N/A":
+            try:
+                r_num = float(roe_val)
+                if r_num <= 1.0 and r_num > 0:
+                    roe_val = round(r_num * 100, 2)
+            except Exception:
+                pass
+        assets.append({
+            "ticker": sym,
+            "sector": data.get("sector_profile", "N/A"),
+            "market_cap_cr": data.get("market_cap_cr", 0.0),
+            "altman_zone": data.get("altman_z", {}).get("zone", "N/A"),
+            "altman_score": data.get("altman_z", {}).get("score", "N/A"),
+            "roe": roe_val,
+            "piotroski_f": data.get("forensics", {}).get("piotroski_f", {}).get("score", "N/A"),
+            "eva_status": data.get("eva", {}).get("status", "N/A")
+        })
+    return sanitize_json({"count": len(assets), "assets": assets})
+
 @app.get("/api/market-overview")
 def get_market_overview():
     indices = [
@@ -393,9 +419,7 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
     elif prob_up <= lower_bound: quant_signal = "NEUTRAL (Macro Bull Guard)" if is_macro_bull else "BEARISH"
     else: quant_signal = "NEUTRAL"
 
-    # =================================================================
-    # FIXED: UPGRADED GEMINI NEWS PARSER TO INTERACTIONS API
-    # =================================================================
+    # Gemini News Brief Engine
     try:
         q = urllib.parse.quote(f"{ticker} stock news India")
         rss_url = f"https://news.google.com/rss/search?q={q}&hl=en-IN&gl=IN&ceid=IN:en"
@@ -426,17 +450,19 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
     raw_fundamentals = INSTITUTIONAL_DB.get(clean_sym)
     
     if raw_fundamentals:
-        fundamentals = dict(raw_fundamentals) # Create a copy to prevent memory contamination
+        fundamentals = dict(raw_fundamentals)
         ui_industry = fundamentals.get("sector_profile", "Database Connected")
         
-        # =================================================================
-        # FIXED: DYNAMIC TEXT INJECTION & ROE MATH CORRECTION
-        # =================================================================
-        # Fix 1: DuPont ROE Scaling (Multiplier)
+        # DuPont ROE Scaling (Multiplier)
         if "roe" in fundamentals.get("dupont", {}) and fundamentals["dupont"]["roe"] != "N/A":
-            fundamentals["dupont"]["roe"] = round(float(fundamentals["dupont"]["roe"]) * 100, 2)
+            try:
+                r_val = float(fundamentals["dupont"]["roe"])
+                if r_val <= 1.0 and r_val > 0:
+                    fundamentals["dupont"]["roe"] = round(r_val * 100, 2)
+            except Exception:
+                pass
             
-        # Fix 2: Injecting missing descriptions for HTML frontend
+        # Injected descriptive strings
         if "altman_z" in fundamentals:
             fundamentals["altman_z"]["desc"] = fundamentals["altman_z"].get("desc", "Derived from verified balance sheet filings.")
             fundamentals["altman_z"]["status"] = fundamentals["altman_z"].get("badge", "yellow")
@@ -453,9 +479,7 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
             if "beneish_m" in fundamentals["forensics"]:
                 fundamentals["forensics"]["beneish_m"]["desc"] = "Multi-variable forensic accrual audit."
         
-        # =================================================================
-        # CRITICAL BFSI EVA INTERCEPTOR: Neutralizes false metrics for banks
-        # =================================================================
+        # BFSI EVA Interceptor
         if ui_industry == "BFSI":
             fundamentals["eva"] = {
                 "eva_cr": "N/A",
@@ -465,9 +489,7 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
                 "status": "Exempt",
                 "verdict": "EVA calculations structurally exempt for Financial Institutions."
             }
-            
     else:
-        # Failsafe for equities currently queued in Colab ingestion
         fundamentals = {
             "sector_profile": "Database Indexing In Progress",
             "market_cap_cr": 0.0,
@@ -480,6 +502,55 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
             }
         }
         ui_industry = "Database Ingestion Queued"
+
+    # =================================================================
+    # TOP 5 SECTOR PEERS MATCHER
+    # =================================================================
+    peers_list = []
+    target_sector = fundamentals.get("sector_profile", "")
+    
+    # Priority 1: Match by identical sector profile
+    for p_sym, p_data in INSTITUTIONAL_DB.items():
+        if p_sym != clean_sym and p_data.get("sector_profile") == target_sector:
+            p_roe = p_data.get("dupont", {}).get("roe", "N/A")
+            if p_roe != "N/A":
+                try:
+                    r_f = float(p_roe)
+                    if r_f <= 1.0 and r_f > 0: p_roe = round(r_f * 100, 2)
+                except Exception: pass
+            peers_list.append({
+                "ticker": p_sym,
+                "sector": p_data.get("sector_profile", "N/A"),
+                "market_cap_cr": p_data.get("market_cap_cr", 0.0),
+                "roe": p_roe,
+                "altman_score": p_data.get("altman_z", {}).get("score", "N/A"),
+                "zone": p_data.get("altman_z", {}).get("zone", "N/A"),
+                "badge": p_data.get("altman_z", {}).get("badge", "green" if "Safe" in p_data.get("altman_z", {}).get("zone", "") else "yellow")
+            })
+            if len(peers_list) >= 5:
+                break
+                
+    # Priority 2: Fallback fill to always guarantee 5 liquid competitors
+    if len(peers_list) < 5:
+        for p_sym, p_data in INSTITUTIONAL_DB.items():
+            if p_sym != clean_sym and p_sym not in [x["ticker"] for x in peers_list]:
+                p_roe = p_data.get("dupont", {}).get("roe", "N/A")
+                if p_roe != "N/A":
+                    try:
+                        r_f = float(p_roe)
+                        if r_f <= 1.0 and r_f > 0: p_roe = round(r_f * 100, 2)
+                    except Exception: pass
+                peers_list.append({
+                    "ticker": p_sym,
+                    "sector": p_data.get("sector_profile", "N/A"),
+                    "market_cap_cr": p_data.get("market_cap_cr", 0.0),
+                    "roe": p_roe,
+                    "altman_score": p_data.get("altman_z", {}).get("score", "N/A"),
+                    "zone": p_data.get("altman_z", {}).get("zone", "N/A"),
+                    "badge": p_data.get("altman_z", {}).get("badge", "yellow")
+                })
+                if len(peers_list) >= 5:
+                    break
 
     response_payload = {
         "ticker": str(ticker),
@@ -495,6 +566,7 @@ def analyze_stock(ticker: str, instrument_key: str = Query(None), friction: floa
         "ai_summary": str(ai_summary),
         "fundamentals": fundamentals,
         "ui_industry": str(ui_industry),
+        "peers": peers_list,
         "trade_setup": {
             "atr_value": float(round(latest_atr_abs, 2))
         },
